@@ -1,0 +1,60 @@
+defaults:
+  - _self_
+
+model:
+  sbert_name: "sentence-transformers/all-MiniLM-L6-v2"
+  attention_augment: False
+  expert:
+    num_experts: 4
+    routing: "softmax"
+    routing_tau: 1.0
+    normalize: True
+    dropout: 0.0
+    factor_dim: 384
+    factor_hidden: 0
+    gate_hidden: 0
+    gate_dropout: 0.0
+    shared_transform: True
+    transform_dropout: 0.0
+    reconstruction_hidden: 0
+    use_token_decoder: False
+    decoder_hidden: 384
+  loss_weights:
+    sent: 1.0
+    token: 1.0
+    entropy: 0.01
+    overlap: 0.01
+    diversity: 0.01
+    balance: 0.01
+  optim:
+    lr: 5e-5
+    weight_decay: 1e-2
+    betas: [0.9, 0.999]
+
+data:
+  rebuild_ds: False
+  train:
+    dataset: "cnn"
+    batch_size: 32
+    num_workers: 4
+    subset: 1.0
+    shuffle: True
+  eval:
+    dataset: "wikiann"
+    batch_size: 32
+    num_workers: 1
+    subset: 1.0
+    shuffle: False
+
+train:
+  epochs: 10
+  grad_clip: 1.0
+
+eval:
+  eval_only: False
+  metrics_only: True
+
+device: "cuda"
+
+logging:
+  metrics_only: False
