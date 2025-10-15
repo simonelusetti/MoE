@@ -15,8 +15,6 @@ class ExpertModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        if not hasattr(cfg, "expert"):
-            raise AttributeError("cfg.model.expert must be defined for ExpertModel")
         expert_cfg = cfg.expert
 
         self.num_experts = int(expert_cfg.num_experts)
@@ -27,12 +25,12 @@ class ExpertModel(nn.Module):
         self.routing_tau = float(expert_cfg.routing_tau)
         self.normalize_factors = bool(expert_cfg.normalize)
         self.dropout = float(expert_cfg.dropout)
+        self.use_balance = expert_cfg.use_balance
+        self.use_diversity = expert_cfg.use_diversity
 
         self.sbert = SentenceTransformer(cfg.sbert_name)
         self.pooler = self.sbert[1]
         enc_hidden = self.sbert[0].auto_model.config.hidden_size
-        if cfg.attention_augment:
-            enc_hidden += 2
 
         factor_dim = int(expert_cfg.factor_dim)
         factor_hidden = int(expert_cfg.factor_hidden)
@@ -115,8 +113,8 @@ class ExpertModel(nn.Module):
         return nn.Sequential(*layers)
 
     def _apply_routing(self, logits, mask):
-        mask = mask.unsqueeze(-1)
-        logits = logits.masked_fill(mask == 0, float("-inf"))
+        mask = mask.unsqueeze(-1).to(logits.dtype)
+        logits = logits.masked_fill(mask == 0, -1e9)
 
         if self.routing == "gumbel":
             routed = F.gumbel_softmax(logits, tau=self.routing_tau, hard=False, dim=-1)
@@ -152,9 +150,6 @@ class ExpertModel(nn.Module):
         return off_diag.pow(2).sum()
 
     def forward(self, embeddings, attention_mask, incoming=None, outgoing=None):
-        if self.cfg.attention_augment and incoming is not None and outgoing is not None:
-            embeddings = torch.cat([embeddings, incoming.unsqueeze(-1), outgoing.unsqueeze(-1)], dim=-1)
-
         mask_float = attention_mask.to(dtype=embeddings.dtype)
         gate_logits = self.gate(embeddings)
         routing_weights = self._apply_routing(gate_logits, mask_float)
@@ -189,13 +184,19 @@ class ExpertModel(nn.Module):
         overlap = 0.5 * (1.0 - pi_sq)
         overlap = (overlap * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
 
-        expert_mass = routing_weights.sum(dim=1)
-        total_tokens = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
-        balanced_mass = expert_mass / total_tokens
-        target = routing_weights.new_full((1, self.num_experts), 1.0 / self.num_experts)
-        balance = ((balanced_mass.mean(dim=0, keepdim=True) - target) ** 2).sum()
+        if self.use_balance:
+            expert_mass = routing_weights.sum(dim=1)
+            total_tokens = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
+            balanced_mass = expert_mass / total_tokens
+            target = routing_weights.new_full((1, self.num_experts), 1.0 / self.num_experts)
+            balance = ((balanced_mass.mean(dim=0, keepdim=True) - target) ** 2).sum()
+        else:
+            balance = routing_weights.new_zeros(())
 
-        diversity = self._compute_diversity_penalty(transformed_factors)
+        if self.use_diversity:
+            diversity = self._compute_diversity_penalty(transformed_factors)
+        else:
+            diversity = routing_weights.new_zeros(())
 
         return {
             "pi": routing_weights,

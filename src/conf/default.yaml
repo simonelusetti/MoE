@@ -3,7 +3,6 @@ defaults:
 
 model:
   sbert_name: "sentence-transformers/all-MiniLM-L6-v2"
-  attention_augment: False
   expert:
     num_experts: 4
     routing: "softmax"
@@ -19,6 +18,8 @@ model:
     reconstruction_hidden: 0
     use_token_decoder: False
     decoder_hidden: 384
+    use_balance: False
+    use_diversity: False
   loss_weights:
     sent: 1.0
     token: 1.0

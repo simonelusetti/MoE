@@ -1,8 +1,10 @@
+import math
 import os
 from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
+from prettytable import PrettyTable
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -11,6 +13,9 @@ from dora import get_xp, hydra_main
 from .data import get_dataset, collate
 from .models import ExpertModel
 from .utils import get_logger, should_disable_tqdm
+
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 def _compute_expert_loss(model, batch, device, weights):
@@ -25,7 +30,6 @@ def _compute_expert_loss(model, batch, device, weights):
 
     outputs = model(embeddings, attention_mask, incoming, outgoing)
     batch_size = embeddings.size(0)
-
     sent_loss = F.mse_loss(outputs["reconstruction"], outputs["anchor"], reduction="sum") / max(batch_size, 1)
 
     token_reconstruction = outputs.get("token_reconstruction")
@@ -41,24 +45,19 @@ def _compute_expert_loss(model, batch, device, weights):
     diversity_loss = outputs["diversity"]
     balance_loss = outputs["balance"]
 
-    total_loss = (
-        weights["sent"] * sent_loss
-        + weights["token"] * token_loss
-        + weights["entropy"] * entropy_loss
-        + weights["overlap"] * overlap_loss
-        + weights["diversity"] * diversity_loss
-        + weights["balance"] * balance_loss
-    )
-
-    metrics = {
-        "total": float(total_loss.detach()),
-        "sent": float(sent_loss.detach()),
-        "token": float(token_loss.detach()),
-        "entropy": float(entropy_loss.detach()),
-        "overlap": float(overlap_loss.detach()),
-        "diversity": float(diversity_loss.detach()),
-        "balance": float(balance_loss.detach()),
+    loss_components = {
+        "sent": sent_loss,
+        "token": token_loss,
+        "entropy": entropy_loss,
+        "overlap": overlap_loss,
+        "diversity": diversity_loss,
+        "balance": balance_loss,
     }
+
+    total_loss = sum(weights[key] * loss_components[key] for key in loss_components.keys())
+
+    metrics = {key: float(value.detach()) for key, value in loss_components.items()}
+    metrics["total"] = float(total_loss.detach())
 
     return total_loss, metrics
 
@@ -77,10 +76,6 @@ def _finalize_metrics(collector, counts):
     return results
 
 
-def _format_metrics(metrics):
-    return ", ".join(f"{key}={value:.4f}" for key, value in sorted(metrics.items()))
-
-
 def _prepare_expert_weights(cfg):
     weights_cfg = cfg.model.loss_weights
     return {
@@ -91,6 +86,50 @@ def _prepare_expert_weights(cfg):
         "diversity": float(weights_cfg.diversity),
         "balance": float(weights_cfg.balance),
     }
+
+
+def _filter_metric(name, value, *, model=None, weights=None):
+    if value is None or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value):
+        return False
+    if weights is not None:
+        weight = weights.get(name)
+        if weight is not None and abs(weight) < 1e-12:
+            return False
+    if model is not None:
+        if name == "balance" and hasattr(model, "use_balance") and not model.use_balance:
+            return False
+        if name == "diversity" and hasattr(model, "use_diversity") and not model.use_diversity:
+            return False
+    return True
+
+
+def _build_train_table(train_metrics, *, model=None, weights=None):
+    if not train_metrics:
+        return "(no train metrics)"
+    table = PrettyTable()
+    filtered = [(name, value) for name, value in sorted(train_metrics.items()) if _filter_metric(name, value, model=model, weights=weights)]
+    if not filtered:
+        return "(no train metrics)"
+    table.field_names = [name for name, _ in filtered]
+    table.add_row([f"{value:.4f}" for _, value in filtered])
+    return table.get_string()
+
+
+def _build_eval_table(factor_metrics):
+    if not factor_metrics:
+        return "(no factor metrics)"
+    table = PrettyTable()
+    table.field_names = ["factor", "precision", "recall", "f1"]
+    for factor, stats in sorted(factor_metrics.items()):
+        table.add_row([
+            factor,
+            f"{stats['precision']:.4f}",
+            f"{stats['recall']:.4f}",
+            f"{stats['f1']:.4f}",
+        ])
+    return table.get_string()
 
 
 def _run_expert_epoch(
@@ -127,6 +166,71 @@ def _run_expert_epoch(
             _update_metrics(collector, counts, metrics)
 
     return _finalize_metrics(collector, counts)
+
+
+def _evaluate_factor_metrics(model, loader, device, logger=None):
+    if not loader:
+        return {}
+
+    model.eval()
+    num_factors = model.num_experts
+    stats = [dict(tp=0, fp=0, fn=0) for _ in range(num_factors)]
+
+    has_ner = None
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Factor Eval", disable=should_disable_tqdm(metrics_only=True)):
+            if "ner_tags" not in batch:
+                has_ner = False
+                break
+            has_ner = True
+
+            embeddings = batch["embeddings"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            incoming = batch.get("incoming")
+            outgoing = batch.get("outgoing")
+            if incoming is not None:
+                incoming = incoming.to(device, non_blocking=True)
+            if outgoing is not None:
+                outgoing = outgoing.to(device, non_blocking=True)
+
+            ner_tags = batch["ner_tags"].to(device, non_blocking=True)
+            outputs = model(embeddings, attention_mask, incoming, outgoing)
+            routing = outputs["pi"].argmax(dim=-1)
+
+            valid = attention_mask > 0
+            gold = (ner_tags > 0) & valid
+
+            for idx in range(num_factors):
+                pred = (routing == idx) & valid
+                tp = (pred & gold).sum().item()
+                fp = (pred & (~gold)).sum().item()
+                fn = ((~pred) & gold).sum().item()
+
+                stats[idx]["tp"] += tp
+                stats[idx]["fp"] += fp
+                stats[idx]["fn"] += fn
+
+    if not has_ner:
+        if logger:
+            logger.warning("No gold ner_tags available; skipping factor metrics.")
+        return {}
+
+    results = {}
+    for idx, counts in enumerate(stats):
+        tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        results[f"factor_{idx}"] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+        }
+
+    return results
 
 
 def _initialize_dataloaders(cfg, logger):
@@ -214,8 +318,6 @@ def train_expert(cfg, logger, train_dl, eval_dl, xp):
             desc=f"Expert Train {epoch + 1}",
             disable_progress=disable_progress,
         )
-        logger.info(f"Epoch {epoch + 1} train: {_format_metrics(train_metrics)}")
-        xp.link.push_metrics({f"expert/train/{epoch + 1}": train_metrics})
 
         eval_metrics = _run_expert_epoch(
             model,
@@ -224,10 +326,21 @@ def train_expert(cfg, logger, train_dl, eval_dl, xp):
             weights,
             train=False,
             desc=f"Expert Eval {epoch + 1}",
-            disable_progress=disable_eval_progress,
+            disable_progress=False,
         )
-        logger.info(f"Epoch {epoch + 1} eval: {_format_metrics(eval_metrics)}")
+
+        factor_metrics = _evaluate_factor_metrics(model, eval_dl, device, logger)
+
+        train_table = _build_train_table(train_metrics, model=model, weights=weights)
+        logger.info("\nTrain metrics (epoch %d):\n%s", epoch + 1, train_table)
+
+        eval_table = _build_eval_table(factor_metrics)
+        logger.info("\nEval factor metrics (epoch %d):\n%s", epoch + 1, eval_table)
+
+        xp.link.push_metrics({f"expert/train/{epoch + 1}": train_metrics})
         xp.link.push_metrics({f"expert/eval/{epoch + 1}": eval_metrics})
+        if factor_metrics:
+            xp.link.push_metrics({f"expert/factors/{epoch + 1}": factor_metrics})
 
         current_eval = eval_metrics.get("total")
         if current_eval is not None and current_eval < best_eval:
@@ -249,18 +362,25 @@ def evaluate_expert(cfg, logger, eval_dl, xp):
     weights = _prepare_expert_weights(cfg)
     disable_progress = should_disable_tqdm(metrics_only=True)
 
-    metrics = _run_expert_epoch(
+    eval_metrics = _run_expert_epoch(
         model,
         eval_dl,
         device,
         weights,
         train=False,
         desc="Expert Evaluation",
-        disable_progress=disable_progress,
+        disable_progress=False,
     )
-    logger.info(f"Expert evaluation: {_format_metrics(metrics)}")
-    xp.link.push_metrics({"expert/eval": metrics})
-    return metrics
+
+    factor_metrics = _evaluate_factor_metrics(model, eval_dl, device, logger)
+
+    eval_table = _build_eval_table(factor_metrics)
+    logger.info("\nEval factor metrics:\n%s", eval_table)
+
+    xp.link.push_metrics({"expert/eval": eval_metrics})
+    if factor_metrics:
+        xp.link.push_metrics({"expert/factors": factor_metrics})
+    return eval_metrics
 
 
 @hydra_main(config_path="conf", config_name="default", version_base="1.1")
