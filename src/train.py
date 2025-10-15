@@ -1,386 +1,239 @@
-import math
 import os
 from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
-from prettytable import PrettyTable
-from torch.utils.data import DataLoader
+
 from tqdm import tqdm
 
 from dora import get_xp, hydra_main
 
-from .data import get_dataset, collate
+from .data import initialize_dataloaders
 from .models import ExpertModel
 from .utils import get_logger, should_disable_tqdm
+from .metrics import build_train_table, build_eval_table, evaluate_factor_metrics
 
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+class ExpertTrainer:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.weights = self._prepare_expert_weights(cfg)
 
-def _compute_expert_loss(model, batch, device, weights):
-    embeddings = batch["embeddings"].to(device, non_blocking=True)
-    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-    incoming = batch.get("incoming")
-    outgoing = batch.get("outgoing")
-    if incoming is not None:
-        incoming = incoming.to(device, non_blocking=True)
-    if outgoing is not None:
-        outgoing = outgoing.to(device, non_blocking=True)
-
-    outputs = model(embeddings, attention_mask, incoming, outgoing)
-    batch_size = embeddings.size(0)
-    sent_loss = F.mse_loss(outputs["reconstruction"], outputs["anchor"], reduction="sum") / max(batch_size, 1)
-
-    token_reconstruction = outputs.get("token_reconstruction")
-    if token_reconstruction is not None:
-        mask = attention_mask.unsqueeze(-1).to(dtype=token_reconstruction.dtype)
-        diff = token_reconstruction - embeddings
-        token_loss = (diff.pow(2) * mask).sum() / mask.sum().clamp_min(1.0)
-    else:
-        token_loss = embeddings.new_tensor(0.0)
-
-    entropy_loss = outputs["entropy"].mean()
-    overlap_loss = outputs["overlap"].mean()
-    diversity_loss = outputs["diversity"]
-    balance_loss = outputs["balance"]
-
-    loss_components = {
-        "sent": sent_loss,
-        "token": token_loss,
-        "entropy": entropy_loss,
-        "overlap": overlap_loss,
-        "diversity": diversity_loss,
-        "balance": balance_loss,
-    }
-
-    total_loss = sum(weights[key] * loss_components[key] for key in loss_components.keys())
-
-    metrics = {key: float(value.detach()) for key, value in loss_components.items()}
-    metrics["total"] = float(total_loss.detach())
-
-    return total_loss, metrics
-
-
-def _update_metrics(collector, counts, metrics):
-    for name, value in metrics.items():
-        collector[name] += value
-        counts[name] += 1
-
-
-def _finalize_metrics(collector, counts):
-    results = {}
-    for name, value in collector.items():
-        denom = counts.get(name, 0)
-        results[name] = value / denom if denom else 0.0
-    return results
-
-
-def _prepare_expert_weights(cfg):
-    weights_cfg = cfg.model.loss_weights
-    return {
-        "sent": float(weights_cfg.sent),
-        "token": float(weights_cfg.token),
-        "entropy": float(weights_cfg.entropy),
-        "overlap": float(weights_cfg.overlap),
-        "diversity": float(weights_cfg.diversity),
-        "balance": float(weights_cfg.balance),
-    }
-
-
-def _filter_metric(name, value, *, model=None, weights=None):
-    if value is None or not isinstance(value, (int, float)):
-        return False
-    if not math.isfinite(value):
-        return False
-    if weights is not None:
-        weight = weights.get(name)
-        if weight is not None and abs(weight) < 1e-12:
-            return False
-    if model is not None:
-        if name == "balance" and hasattr(model, "use_balance") and not model.use_balance:
-            return False
-        if name == "diversity" and hasattr(model, "use_diversity") and not model.use_diversity:
-            return False
-    return True
-
-
-def _build_train_table(train_metrics, *, model=None, weights=None):
-    if not train_metrics:
-        return "(no train metrics)"
-    table = PrettyTable()
-    filtered = [(name, value) for name, value in sorted(train_metrics.items()) if _filter_metric(name, value, model=model, weights=weights)]
-    if not filtered:
-        return "(no train metrics)"
-    table.field_names = [name for name, _ in filtered]
-    table.add_row([f"{value:.4f}" for _, value in filtered])
-    return table.get_string()
-
-
-def _build_eval_table(factor_metrics):
-    if not factor_metrics:
-        return "(no factor metrics)"
-    table = PrettyTable()
-    table.field_names = ["factor", "precision", "recall", "f1"]
-    for factor, stats in sorted(factor_metrics.items()):
-        table.add_row([
-            factor,
-            f"{stats['precision']:.4f}",
-            f"{stats['recall']:.4f}",
-            f"{stats['f1']:.4f}",
-        ])
-    return table.get_string()
-
-
-def _run_expert_epoch(
-    model,
-    loader,
-    device,
-    weights,
-    *,
-    train=False,
-    optimizer=None,
-    grad_clip=0.0,
-    desc="",
-    disable_progress=False,
-):
-    collector = defaultdict(float)
-    counts = defaultdict(int)
-
-    if train and optimizer is None:
-        raise ValueError("Optimizer must be provided when train=True.")
-
-    model.train() if train else model.eval()
-    context = torch.enable_grad() if train else torch.no_grad()
-
-    with context:
-        for batch in tqdm(loader, desc=desc, disable=disable_progress):
-            if train:
-                optimizer.zero_grad(set_to_none=True)
-            total_loss, metrics = _compute_expert_loss(model, batch, device, weights)
-            if train:
-                total_loss.backward()
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-            _update_metrics(collector, counts, metrics)
-
-    return _finalize_metrics(collector, counts)
-
-
-def _evaluate_factor_metrics(model, loader, device, logger=None):
-    if not loader:
-        return {}
-
-    model.eval()
-    num_factors = model.num_experts
-    stats = [dict(tp=0, fp=0, fn=0) for _ in range(num_factors)]
-
-    has_ner = None
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Factor Eval", disable=should_disable_tqdm(metrics_only=True)):
-            if "ner_tags" not in batch:
-                has_ner = False
-                break
-            has_ner = True
-
-            embeddings = batch["embeddings"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            incoming = batch.get("incoming")
-            outgoing = batch.get("outgoing")
-            if incoming is not None:
-                incoming = incoming.to(device, non_blocking=True)
-            if outgoing is not None:
-                outgoing = outgoing.to(device, non_blocking=True)
-
-            ner_tags = batch["ner_tags"].to(device, non_blocking=True)
-            outputs = model(embeddings, attention_mask, incoming, outgoing)
-            routing = outputs["pi"].argmax(dim=-1)
-
-            valid = attention_mask > 0
-            gold = (ner_tags > 0) & valid
-
-            for idx in range(num_factors):
-                pred = (routing == idx) & valid
-                tp = (pred & gold).sum().item()
-                fp = (pred & (~gold)).sum().item()
-                fn = ((~pred) & gold).sum().item()
-
-                stats[idx]["tp"] += tp
-                stats[idx]["fp"] += fp
-                stats[idx]["fn"] += fn
-
-    if not has_ner:
-        if logger:
-            logger.warning("No gold ner_tags available; skipping factor metrics.")
-        return {}
-
-    results = {}
-    for idx, counts in enumerate(stats):
-        tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-        results[f"factor_{idx}"] = {
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
+    @staticmethod
+    def _prepare_expert_weights(cfg):
+        weights_cfg = cfg.model.loss_weights
+        return {
+            "sent": float(weights_cfg.sent),
+            "token": float(weights_cfg.token),
+            "entropy": float(weights_cfg.entropy),
+            "overlap": float(weights_cfg.overlap),
+            "diversity": float(weights_cfg.diversity),
+            "balance": float(weights_cfg.balance),
         }
 
-    return results
+    def _loss(self, model, batch, device):
+        embeddings = batch["embeddings"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        incoming = batch.get("incoming")
+        outgoing = batch.get("outgoing")
+        if incoming is not None:
+            incoming = incoming.to(device, non_blocking=True)
+        if outgoing is not None:
+            outgoing = outgoing.to(device, non_blocking=True)
+
+        outputs = model(embeddings, attention_mask, incoming, outgoing)
+        batch_size = embeddings.size(0)
+        sent_loss = F.mse_loss(outputs["reconstruction"], outputs["anchor"], reduction="sum") / max(batch_size, 1)
+
+        token_reconstruction = outputs.get("token_reconstruction")
+        if token_reconstruction is not None:
+            mask = attention_mask.unsqueeze(-1).to(dtype=token_reconstruction.dtype)
+            diff = token_reconstruction - embeddings
+            token_loss = (diff.pow(2) * mask).sum() / mask.sum().clamp_min(1.0)
+        else:
+            token_loss = embeddings.new_tensor(0.0)
+
+        entropy_loss = outputs["entropy"].mean()
+        overlap_loss = outputs["overlap"].mean()
+        diversity_loss = outputs["diversity"]
+        balance_loss = outputs["balance"]
+
+        loss_components = {
+            "sent": sent_loss,
+            "token": token_loss,
+            "entropy": entropy_loss,
+            "overlap": overlap_loss,
+            "diversity": diversity_loss,
+            "balance": balance_loss,
+        }
+
+        total_loss = sum(self.weights[key] * loss_components[key] for key in loss_components)
+        metrics = {key: float(value.detach()) for key, value in loss_components.items()}
+        metrics["total"] = float(total_loss.detach())
+        return total_loss, metrics
+
+    def _run_epoch(
+        self,
+        model,
+        loader,
+        device,
+        *,
+        train=False,
+        optimizer=None,
+        grad_clip=0.0,
+        desc="",
+        disable_progress=False,
+    ):
+        if train and optimizer is None:
+            raise ValueError("Optimizer must be provided when train=True.")
+
+        sums = defaultdict(float)
+        counts = defaultdict(int)
+
+        model.train() if train else model.eval()
+        context = torch.enable_grad() if train else torch.no_grad()
+
+        with context:
+            iterator = tqdm(loader, desc=desc, disable=disable_progress)
+            for batch in iterator:
+                if train:
+                    optimizer.zero_grad(set_to_none=True)
+                total_loss, metrics = self._loss(model, batch, device)
+                if train:
+                    total_loss.backward()
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+                for name, value in metrics.items():
+                    sums[name] += value
+                    counts[name] += 1
+
+        return {name: (sums[name] / counts[name]) if counts[name] else 0.0 for name in sums}
 
 
-def _initialize_dataloaders(cfg, logger):
-    train_ds, _ = get_dataset(
-        name=cfg.data.train.dataset,
-        subset=cfg.data.train.subset,
-        rebuild=cfg.data.rebuild_ds,
-        shuffle=cfg.data.train.shuffle,
-    )
-    eval_shuffle = bool(cfg.data.eval.shuffle)
-    if eval_shuffle:
-        logger.warning("Disabling shuffle for expert evaluation loader to preserve ordering.")
-        eval_shuffle = False
-
-    eval_ds, _ = get_dataset(
-        split="validation",
-        name=cfg.data.eval.dataset,
-        subset=cfg.data.eval.subset,
-        rebuild=cfg.data.rebuild_ds,
-        shuffle=eval_shuffle,
-    )
-
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=cfg.data.train.batch_size,
-        collate_fn=collate,
-        num_workers=cfg.data.train.num_workers,
-        pin_memory=(cfg.device == "cuda"),
-        persistent_workers=(cfg.data.train.num_workers > 0),
-        shuffle=cfg.data.train.shuffle,
-    )
-    eval_dl = DataLoader(
-        eval_ds,
-        batch_size=cfg.data.eval.batch_size,
-        collate_fn=collate,
-        num_workers=cfg.data.eval.num_workers,
-        pin_memory=(cfg.device == "cuda"),
-        persistent_workers=(cfg.data.eval.num_workers > 0),
-        shuffle=eval_shuffle,
-    )
-    return train_dl, eval_dl
+    def _save_checkpoint(self, model, path, logger):
+        torch.save(model.state_dict(), path)
+        logger.info(f"Saved ExpertModel checkpoint to {path}")
 
 
-def _save_checkpoint(model, path, logger):
-    torch.save(model.state_dict(), path)
-    logger.info(f"Saved ExpertModel checkpoint to {path}")
+    def _load_checkpoint(self, model, path, device, logger):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Expert checkpoint not found at {path}")
+        state = torch.load(path, map_location=device)
+        model.load_state_dict(state)
+        logger.info(f"Loaded ExpertModel checkpoint from {path}")
 
 
-def _load_checkpoint(model, path, device, logger):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Expert checkpoint not found at {path}")
-    state = torch.load(path, map_location=device)
-    model.load_state_dict(state)
-    logger.info(f"Loaded ExpertModel checkpoint from {path}")
+    def train(self, cfg, logger, train_dl, eval_dl, xp):
+        device = cfg.device
+        model = ExpertModel(cfg.model).to(device)
 
-
-def train_expert(cfg, logger, train_dl, eval_dl, xp):
-    device = cfg.device
-    model = ExpertModel(cfg.model).to(device)
-
-    optim_cfg = cfg.model.optim
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=optim_cfg.lr,
-        weight_decay=optim_cfg.weight_decay,
-        betas=optim_cfg.betas,
-    )
-    grad_clip = cfg.train.grad_clip
-    weights = _prepare_expert_weights(cfg)
-    disable_progress = should_disable_tqdm()
-    disable_eval_progress = should_disable_tqdm(metrics_only=True)
-
-    checkpoint_path = "expert_model.pth"
-    best_eval = float("inf")
-
-    for epoch in range(cfg.train.epochs):
-        train_metrics = _run_expert_epoch(
-            model,
-            train_dl,
-            device,
-            weights,
-            train=True,
-            optimizer=optimizer,
-            grad_clip=grad_clip,
-            desc=f"Expert Train {epoch + 1}",
-            disable_progress=disable_progress,
+        optim_cfg = cfg.model.optim
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=optim_cfg.lr,
+            weight_decay=optim_cfg.weight_decay,
+            betas=optim_cfg.betas,
         )
+        grad_clip = cfg.train.grad_clip
+        disable_progress = should_disable_tqdm()
 
-        eval_metrics = _run_expert_epoch(
+        checkpoint_path = "expert_model.pth"
+        best_f1 = float("-inf")
+        best_epoch = None
+        best_factor = None
+
+        for epoch in range(cfg.train.epochs):
+            train_metrics = self._run_epoch(
+                model,
+                train_dl,
+                device,
+                train=True,
+                optimizer=optimizer,
+                grad_clip=grad_clip,
+                desc=f"Expert Train {epoch + 1}",
+                disable_progress=disable_progress,
+            )
+
+            train_table = build_train_table(train_metrics, model=model, weights=self.weights)
+            logger.info("\nTrain metrics (epoch %d):\n%s", epoch + 1, train_table)
+
+            xp.link.push_metrics({f"expert/train/{epoch + 1}": train_metrics})
+
+            eval_metrics = self._run_epoch(
+                model,
+                eval_dl,
+                device,
+                train=False,
+                desc=f"Expert Eval {epoch + 1}",
+                disable_progress=False,
+            )
+            factor_metrics = evaluate_factor_metrics(model, eval_dl, device, logger)
+
+            eval_table = build_eval_table(factor_metrics)
+            logger.info("\nEval factor metrics (epoch %d):\n%s", epoch + 1, eval_table)
+
+            xp.link.push_metrics({f"expert/eval/{epoch + 1}": eval_metrics})
+            if factor_metrics:
+                xp.link.push_metrics({f"expert/factors/{epoch + 1}": factor_metrics})
+
+            top_factor = None
+            top_f1 = float("-inf")
+            for factor, stats in (factor_metrics or {}).items():
+                f1 = stats.get("f1", 0.0)
+                if f1 > top_f1:
+                    top_f1 = f1
+                    top_factor = factor
+
+            if top_factor is not None and top_f1 > best_f1:
+                best_f1 = top_f1
+                best_epoch = epoch + 1
+                best_factor = top_factor
+                self._save_checkpoint(model, checkpoint_path, logger)
+
+        if best_epoch is None:
+            self._save_checkpoint(model, checkpoint_path, logger)
+            logger.info("No factor improvements detected; saved final model.")
+        else:
+            logger.info(
+                "Best epoch %d with factor %s achieving F1 %.4f",
+                best_epoch,
+                best_factor,
+                best_f1,
+            )
+            xp.link.push_metrics({"expert/best_epoch": best_epoch, "expert/best_factor": best_factor, "expert/best_f1": best_f1})
+
+        return model
+
+
+    def evaluate(self, cfg, logger, eval_dl, xp):
+        device = cfg.device
+        model = ExpertModel(cfg.model).to(device)
+        checkpoint_path = "expert_model.pth"
+        self._load_checkpoint(model, checkpoint_path, device, logger)
+
+        eval_metrics = self._run_epoch(
             model,
             eval_dl,
             device,
-            weights,
             train=False,
-            desc=f"Expert Eval {epoch + 1}",
+            desc="Expert Evaluation",
             disable_progress=False,
         )
+        factor_metrics = evaluate_factor_metrics(model, eval_dl, device, logger)
 
-        factor_metrics = _evaluate_factor_metrics(model, eval_dl, device, logger)
+        loss_table = build_train_table(eval_metrics, model=model, weights=self.weights)
+        logger.info("\nEval loss metrics:\n%s", loss_table)
 
-        train_table = _build_train_table(train_metrics, model=model, weights=weights)
-        logger.info("\nTrain metrics (epoch %d):\n%s", epoch + 1, train_table)
+        eval_table = build_eval_table(factor_metrics)
+        logger.info("\nEval factor metrics:\n%s", eval_table)
 
-        eval_table = _build_eval_table(factor_metrics)
-        logger.info("\nEval factor metrics (epoch %d):\n%s", epoch + 1, eval_table)
-
-        xp.link.push_metrics({f"expert/train/{epoch + 1}": train_metrics})
-        xp.link.push_metrics({f"expert/eval/{epoch + 1}": eval_metrics})
+        xp.link.push_metrics({"expert/eval": eval_metrics})
         if factor_metrics:
-            xp.link.push_metrics({f"expert/factors/{epoch + 1}": factor_metrics})
-
-        current_eval = eval_metrics.get("total")
-        if current_eval is not None and current_eval < best_eval:
-            best_eval = current_eval
-            _save_checkpoint(model, checkpoint_path, logger)
-
-    if best_eval == float("inf"):
-        _save_checkpoint(model, checkpoint_path, logger)
-
-    return model
-
-
-def evaluate_expert(cfg, logger, eval_dl, xp):
-    device = cfg.device
-    model = ExpertModel(cfg.model).to(device)
-    checkpoint_path = "expert_model.pth"
-    _load_checkpoint(model, checkpoint_path, device, logger)
-
-    weights = _prepare_expert_weights(cfg)
-    disable_progress = should_disable_tqdm(metrics_only=True)
-
-    eval_metrics = _run_expert_epoch(
-        model,
-        eval_dl,
-        device,
-        weights,
-        train=False,
-        desc="Expert Evaluation",
-        disable_progress=False,
-    )
-
-    factor_metrics = _evaluate_factor_metrics(model, eval_dl, device, logger)
-
-    eval_table = _build_eval_table(factor_metrics)
-    logger.info("\nEval factor metrics:\n%s", eval_table)
-
-    xp.link.push_metrics({"expert/eval": eval_metrics})
-    if factor_metrics:
-        xp.link.push_metrics({"expert/factors": factor_metrics})
-    return eval_metrics
+            xp.link.push_metrics({"expert/factors": factor_metrics})
+        return eval_metrics, factor_metrics
 
 
 @hydra_main(config_path="conf", config_name="default", version_base="1.1")
@@ -396,12 +249,14 @@ def main(cfg):
         logger.warning("No GPU available, switching to CPU")
     cfg.device = cfg.device if torch.cuda.is_available() else "cpu"
 
-    train_dl, eval_dl = _initialize_dataloaders(cfg, logger)
+    trainer = ExpertTrainer(cfg)
+
+    train_dl, eval_dl = initialize_dataloaders(cfg, logger)
 
     if cfg.eval.eval_only:
-        evaluate_expert(cfg, logger, eval_dl, xp)
+        trainer.evaluate(cfg, logger, eval_dl, xp)
     else:
-        train_expert(cfg, logger, train_dl, eval_dl, xp)
+        trainer.train(cfg, logger, train_dl, eval_dl, xp)
 
 
 if __name__ == "__main__":

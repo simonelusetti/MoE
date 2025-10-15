@@ -4,6 +4,7 @@ import numpy as np
 from datasets import load_dataset, load_from_disk, DownloadConfig
 from transformers import AutoTokenizer, AutoModel
 from dora import to_absolute_path
+from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ def _encode_examples(ds, tok, encoder, text_fn, max_length, keep_labels=None):
     return ds.map(_tokenize_and_encode, remove_columns=ds.column_names, batched=False)
 
 
-def _build_dataset(name, split, tokenizer_name, max_length, subset=None, shuffle=False, cnn_field=None):
+def build_dataset(name, split, tokenizer_name, max_length, subset=None, shuffle=False, cnn_field=None):
     """
     Generic dataset builder for CNN, WikiANN, and CoNLL.
     """
@@ -126,6 +127,45 @@ def _build_dataset(name, split, tokenizer_name, max_length, subset=None, shuffle
     ds = _encode_examples(ds, tok, encoder, text_fn, max_length, keep_labels)
     return ds, tok
 
+def initialize_dataloaders(cfg, logger):
+    train_ds, _ = get_dataset(
+        name=cfg.data.train.dataset,
+        subset=cfg.data.train.subset,
+        rebuild=cfg.data.rebuild_ds,
+        shuffle=cfg.data.train.shuffle,
+    )
+    eval_shuffle = bool(cfg.data.eval.shuffle)
+    if eval_shuffle:
+        logger.warning("Disabling shuffle for expert evaluation loader to preserve ordering.")
+        eval_shuffle = False
+
+    eval_ds, _ = get_dataset(
+        split="validation",
+        name=cfg.data.eval.dataset,
+        subset=cfg.data.eval.subset,
+        rebuild=cfg.data.rebuild_ds,
+        shuffle=eval_shuffle,
+    )
+
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=cfg.data.train.batch_size,
+        collate_fn=collate,
+        num_workers=cfg.data.train.num_workers,
+        pin_memory=(cfg.device == "cuda"),
+        persistent_workers=(cfg.data.train.num_workers > 0),
+        shuffle=cfg.data.train.shuffle,
+    )
+    eval_dl = DataLoader(
+        eval_ds,
+        batch_size=cfg.data.eval.batch_size,
+        collate_fn=collate,
+        num_workers=cfg.data.eval.num_workers,
+        pin_memory=(cfg.device == "cuda"),
+        persistent_workers=(cfg.data.eval.num_workers > 0),
+        shuffle=eval_shuffle,
+    )
+    return train_dl, eval_dl
 
 # ---------- Collate ----------
 
@@ -201,7 +241,7 @@ def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
         ds = load_from_disk(path)
     else:
         logger.info(f"Building dataset {name} and saving to {path}")
-        ds, tok = _build_dataset(name, split, tokenizer_name, max_length, subset, shuffle, cnn_field)
+        ds, tok = build_dataset(name, split, tokenizer_name, max_length, subset, shuffle, cnn_field)
         ds.save_to_disk(path)
 
     if shuffle:
