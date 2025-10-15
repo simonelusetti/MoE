@@ -59,3 +59,25 @@ device: "cuda"
 
 logging:
   metrics_only: False
+
+array: 0
+
+dora:
+  exclude: ["eval.*", "data.rebuild_ds", "logging.*"]
+
+slurm:
+  partition: "boost_usr_prod"
+  gpus: 1
+  mem_per_gpu: 32
+  time: 240          # minutes
+  cpus_per_gpu: 8
+  setup:
+    - "module load python/3.11.7"
+    - "source $HOME/RatCon/.venv/bin/activate"
+    - "export SLURM_CPU_BIND=none"
+    - "export HF_HOME=/leonardo_work/IscrC_LUSE/$USER/hf-cache"
+    - "export HF_DATASETS_CACHE=$HF_HOME/datasets"
+    - "export TRANSFORMERS_CACHE=$HF_HOME/transformers"
+    - "export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub"
+    - "export HF_HUB_OFFLINE=1"
+    - "export TRANSFORMERS_OFFLINE=1"

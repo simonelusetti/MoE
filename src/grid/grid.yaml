@@ -1,12 +1,12 @@
 baseline:
   data.train.dataset: wikiann
-  data.train.subset: 1.0
+  data.train.subset: 0.0
   data.eval.dataset: wikiann
   data.eval.subset: 1.0
   model.expert.use_balance: true
   model.expert.use_diversity: true
+  dora.dir: "outputs_grids"
 
 sweep:
-  model.expert.num_experts: [3, 4]
-  model.loss_weights.entropy: [0.01, 0.05]
-  array: [0, 1]
+  model.expert.num_experts: [2, 3, 4, 5, 10]
+  array: [0, 1, 2]
