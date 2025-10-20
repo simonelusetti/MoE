@@ -11,6 +11,9 @@ from collections import defaultdict
 from itertools import combinations
 from collections import defaultdict
 from itertools import combinations
+from pathlib import Path
+from typing import Optional
+
 from tqdm import tqdm
 
 import torch
@@ -57,6 +60,12 @@ def parse_args():
         default=None,
         help="Optional cap on the number of partition pairs evaluated (for quick experiments).",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional file to write the formatted summary to.",
+    )
     return parser.parse_args()
 
 
@@ -96,8 +105,14 @@ def main():
     device = resolve_device()
     model = SentenceTransformer(args.model, device=device)
 
+    log_lines = []
+
+    def log_line(message: str = "") -> None:
+        print(message)
+        log_lines.append(message)
+
     dataset = load_subset(args.split, args.subset, args.seed)
-    print(f"Loaded {len(dataset)} examples from wikiann:{args.split} (device={device}).")
+    log_line(f"Loaded {len(dataset)} examples from wikiann:{args.split} (device={device}).")
 
     stats = defaultdict(list)
     bucket_scores = defaultdict(list)
@@ -181,7 +196,11 @@ def main():
             break
 
     if not stats:
-        print("No partitions processed; check subset size or filtering conditions.")
+        message = "No partitions processed; check subset size or filtering conditions."
+        log_line(message)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(message + "\n", encoding="utf-8")
         return
 
     summary = []
@@ -192,8 +211,17 @@ def main():
 
     summary.sort(key=lambda item: (item[0] + item[1], item[0], item[1]))
 
-    print(f"\nProcessed sentences: {processed_sentences}")
-    print(f"Evaluated partitions: {processed_partitions}\n")
+    summary_table = PrettyTable()
+    summary_table.field_names = ["entities_left", "entities_right", "count", "mean_cosine_sum"]
+    for ent_left, ent_right, count, mean_value in summary:
+        summary_table.add_row([ent_left, ent_right, count, f"{mean_value:.4f}"])
+
+    log_line("")
+    log_line("Partition summary (cosine left/right vs full):")
+    log_line(summary_table.get_string())
+    log_line("")
+    log_line(f"Processed sentences: {processed_sentences}")
+    log_line(f"Evaluated partitions: {processed_partitions}")
 
     if bucket_scores:
         bucket_table = PrettyTable()
@@ -201,8 +229,15 @@ def main():
         for bucket, scores in sorted(bucket_scores.items()):
             mean_val = sum(scores) / len(scores)
             bucket_table.add_row([bucket, len(scores), f"{mean_val:.4f}"])
-        print("\nAggregate by entity distribution:")
-        print(bucket_table)
+        log_line("")
+        log_line("Aggregate by entity distribution:")
+        log_line(bucket_table.get_string())
+
+    if args.output:
+        output_path = args.output
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(log_lines) + ("\n" if log_lines else ""), encoding="utf-8")
+        print(f"Saved summary to {output_path}")
 
 
 
