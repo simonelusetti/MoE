@@ -20,6 +20,7 @@ class ExpertTrainer:
     def __init__(self, cfg):
         self.cfg = cfg
         self.weights = self._prepare_expert_weights(cfg)
+        self.contrastive_tau = getattr(cfg.model, "contrastive_tau", 0.07)
 
     @staticmethod
     def _prepare_expert_weights(cfg):
@@ -44,8 +45,17 @@ class ExpertTrainer:
             outgoing = outgoing.to(device, non_blocking=True)
 
         outputs = model(embeddings, attention_mask, incoming, outgoing)
-        batch_size = embeddings.size(0)
-        sent_loss = F.mse_loss(outputs["reconstruction"], outputs["anchor"], reduction="sum") / max(batch_size, 1)
+        anchor = outputs["anchor"]
+        reconstruction = outputs["reconstruction"]
+
+        anchor = F.normalize(anchor, dim=-1)
+        reconstruction = F.normalize(reconstruction, dim=-1)
+
+        logits = anchor @ reconstruction.t() / max(self.contrastive_tau, 1e-6)
+        targets = torch.arange(logits.size(0), device=logits.device)
+        loss_ab = F.cross_entropy(logits, targets)
+        loss_ba = F.cross_entropy(logits.t(), targets)
+        sent_loss = 0.5 * (loss_ab + loss_ba)
 
         token_reconstruction = outputs.get("token_reconstruction")
         if token_reconstruction is not None:
