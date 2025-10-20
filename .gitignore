@@ -1,7 +1,9 @@
 .venv/
 __pycache__/
+data
 data/*
 outputs/
+outputs
 outputs_grids/
 ratcon/__pycache__
 playground.ipynb

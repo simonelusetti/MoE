@@ -1,37 +1,13 @@
 # data.py
 import os, logging, torch
 import numpy as np
-from datasets import load_dataset, load_from_disk, DownloadConfig
+from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer, AutoModel
 from dora import to_absolute_path
 from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
-
-# Cache/load configuration
-_OFFLINE_ENV_VARS = (
-    "HF_HUB_OFFLINE",
-    "TRANSFORMERS_OFFLINE",
-    "HF_DATASETS_OFFLINE",
-)
-
-
-def _is_offline():
-    for var in _OFFLINE_ENV_VARS:
-        if os.getenv(var) in ("1", "true", "True"):
-            return True
-    return False
-
-
-def _load_dataset(name, *args, **kwargs):
-    cache_dir = os.getenv("HF_HOME") or os.getenv("HF_DATASETS_CACHE")
-    if cache_dir:
-        kwargs.setdefault("cache_dir", cache_dir)
-    offline = _is_offline()
-    kwargs.setdefault("download_mode", "reuse_dataset_if_exists")
-    kwargs.setdefault("download_config", DownloadConfig(local_files_only=offline))
-    return load_dataset(name, *args, **kwargs)
 
 # ---------- Helpers ----------
 
@@ -99,16 +75,16 @@ def build_dataset(name, split, tokenizer_name, max_length, subset=None, shuffle=
     """
     # pick dataset + text extraction strategy
     if name == "cnn":
-        ds = _load_dataset("cnn_dailymail", "3.0.0", split=split)
+        ds = load_dataset("cnn_dailymail", "3.0.0", split=split)
         if cnn_field is None: cnn_field = "highlights"
         text_fn = lambda x: x[cnn_field]
         keep_labels = []
     elif name == "wikiann":
-        ds = _load_dataset("wikiann", "en", split=split)
+        ds = load_dataset("wikiann", "en", split=split)
         text_fn = lambda x: " ".join(x["tokens"])
         keep_labels = ["ner_tags", "tokens"]
     elif name == "conll2003":
-        ds = _load_dataset("conll2003", revision="refs/convert/parquet", split=split)
+        ds = load_dataset("conll2003", revision="refs/convert/parquet", split=split)
         text_fn = lambda x: " ".join(x["tokens"])
         keep_labels = ["ner_tags", "tokens"]
     else:
@@ -236,13 +212,19 @@ def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
     path = to_absolute_path(path)
     tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
-    if os.path.exists(path) and not rebuild:
-        logger.info(f"Loading cached dataset from {path}")
+    if rebuild:
+        raise RuntimeError("Dataset rebuilds are handled by tools/build_dataset.py. Run it before launching training.")
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Dataset cache {path} not found. Run `tools/build_dataset.py --dataset {name} --splits {split}` to materialise it."
+        )
+
+    logger.info(f"Loading cached dataset from {path}")
+    try:
         ds = load_from_disk(path)
-    else:
-        logger.info(f"Building dataset {name} and saving to {path}")
-        ds, tok = build_dataset(name, split, tokenizer_name, max_length, subset, shuffle, cnn_field)
-        ds.save_to_disk(path)
+    except (FileNotFoundError, ValueError) as err:
+        raise RuntimeError("Dataset cache is unreadable. Rebuild it with tools/build_dataset.py.") from err
 
     if shuffle:
         ds = ds.shuffle(seed=42)

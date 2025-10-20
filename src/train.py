@@ -114,7 +114,7 @@ class ExpertTrainer:
 
 
     def _save_checkpoint(self, model, path, logger):
-        torch.save(model.state_dict(), path)
+        torch.save(model.state_dict(), path, _use_new_zipfile_serialization=False)
         logger.info(f"Saved ExpertModel checkpoint to {path}")
 
 
