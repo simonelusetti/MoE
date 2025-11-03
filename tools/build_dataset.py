@@ -16,14 +16,26 @@ if str(REPO_ROOT) not in sys.path:
 from src.data import build_dataset
 
 
-def _dataset_filename(name: str, split: str, subset: Optional[Union[int, float]], cnn_field: Optional[str]) -> str:
-    if cnn_field is not None:
-        if subset is not None and subset != 1.0:
-            return f"{name}_{cnn_field}_{split}_{subset}.pt"
-        return f"{name}_{cnn_field}_{split}.pt"
+def _sanitize_fragment(fragment: str) -> str:
+    return fragment.replace("/", "-")
+
+
+def _dataset_filename(
+    name: str,
+    split: str,
+    subset: Optional[Union[int, float]],
+    cnn_field: Optional[str],
+    dataset_config: Optional[str],
+) -> str:
+    parts = [name]
+    if dataset_config:
+        parts.append(_sanitize_fragment(dataset_config))
+    if cnn_field:
+        parts.append(cnn_field)
+    parts.append(split)
     if subset is not None and subset != 1.0:
-        return f"{name}_{split}_{subset}.pt"
-    return f"{name}_{split}.pt"
+        parts.append(str(subset))
+    return "_".join(parts) + ".pt"
 
 
 def _parse_subset(value: Optional[str]) -> Optional[Union[int, float]]:
@@ -48,10 +60,11 @@ def _prepare_dataset(
     tokenizer: str,
     max_length: int,
     cnn_field: Optional[str],
+    dataset_config: Optional[str],
     rebuild: bool,
     shuffle: bool,
 ) -> Path:
-    relative = Path("data") / _dataset_filename(name, split, subset, cnn_field)
+    relative = Path("data") / _dataset_filename(name, split, subset, cnn_field, dataset_config)
     target = Path(to_absolute_path(str(relative)))
 
     if target.exists():
@@ -75,6 +88,7 @@ def _prepare_dataset(
         subset=subset,
         shuffle=shuffle,
         cnn_field=cnn_field,
+        dataset_config=dataset_config,
     )
     dataset.save_to_disk(str(target))
     return target
@@ -82,12 +96,17 @@ def _prepare_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=("cnn", "wikiann", "conll2003"), required=True)
+    parser.add_argument("--dataset", choices=("cnn", "wikiann", "conll2003", "framenet"), required=True)
     parser.add_argument("--splits", nargs="+", default=["train"], help="Dataset splits to prepare (default: %(default)s)")
     parser.add_argument("--subset", default=None, help="Subset value matching src.data expectations (e.g. 0.1, 1000, None)")
     parser.add_argument("--tokenizer", default="sentence-transformers/all-MiniLM-L6-v2", help="Tokenizer/model id to use")
     parser.add_argument("--max-length", type=int, default=256, help="Max sequence length (default: %(default)s)")
     parser.add_argument("--cnn-field", default=None, help="Field to extract from CNN DailyMail (default inferred in code)")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Optional dataset configuration (e.g. FrameNet 'fulltext').",
+    )
     parser.add_argument("--shuffle", action="store_true", help="Shuffle dataset before saving")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuilding even if cache exists")
     return parser.parse_args()
@@ -99,6 +118,9 @@ def main() -> None:
     cnn_field = args.cnn_field
     if args.dataset == "cnn" and cnn_field is None:
         cnn_field = "highlights"
+    dataset_config = args.config
+    if args.dataset == "framenet" and dataset_config is None:
+        dataset_config = "fulltext"
 
     prepared = []
     for split in args.splits:
@@ -109,6 +131,7 @@ def main() -> None:
             tokenizer=args.tokenizer,
             max_length=args.max_length,
             cnn_field=cnn_field,
+            dataset_config=dataset_config,
             rebuild=args.rebuild,
             shuffle=args.shuffle,
         )

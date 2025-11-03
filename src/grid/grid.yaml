@@ -1,10 +1,9 @@
 baseline:
-  data.train.dataset: conll2003
+  data.train.dataset: wikiann
   data.train.subset: 1.0
-  data.eval.dataset: conll2003
+  data.eval.dataset: wikiann
   data.eval.subset: 1.0
   model.expert.use_balance: true
-  model.expert.use_diversity: true
   train.epochs: 30
 
 sweep:

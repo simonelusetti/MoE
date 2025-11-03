@@ -1,7 +1,7 @@
 #!/bin/bash
-# Run exploration/partition_analysis.py on a compute node.
+# Run exploration/partition_analysis.py on the FrameNet dataset.
 
-#SBATCH --job-name=partition_analysis
+#SBATCH --job-name=partition_framenet
 #SBATCH --partition=boost_usr_prod
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --output=/leonardo_work/IscrC_LUSE/slusetti/MoE-outputs/partition_analysis_%j.log
+#SBATCH --output=/leonardo_work/IscrC_LUSE/slusetti/MoE-outputs/partition_framenet_%j.log
 
 set -euo pipefail
 
@@ -27,11 +27,14 @@ export TRANSFORMERS_OFFLINE=1
 
 cd /leonardo/home/userexternal/slusetti/MoE
 
-OUTPUT_FILE=/leonardo_work/IscrC_LUSE/slusetti/MoE-outputs/partition_analysis_${SLURM_JOB_ID}.txt
+OUTPUT_FILE=/leonardo_work/IscrC_LUSE/slusetti/MoE-outputs/partition_framenet_${SLURM_JOB_ID}.txt
+FRAMENET_CACHE=$HF_DATASETS_CACHE/liyucheng__FrameNet_v17
 
 python exploration/partition_analysis.py \
-  --subset 1 \
+  --dataset framenet \
   --split train \
+  --subset 1 \
   --model sentence-transformers/all-MiniLM-L6-v2 \
-  --partitions-per-length 4096 \
+  --partitions-per-length 512 \
+  --framenet-cache "$FRAMENET_CACHE" \
   --output "$OUTPUT_FILE"

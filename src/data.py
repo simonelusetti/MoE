@@ -1,15 +1,35 @@
 # data.py
-import os, logging, torch
+import ast
+import os
+import logging
+import torch
 import numpy as np
-from datasets import load_dataset, load_from_disk
+from datasets import Dataset, load_dataset, load_from_disk
 from transformers import AutoTokenizer, AutoModel
 from dora import to_absolute_path
 from torch.utils.data import DataLoader
+from huggingface_hub import hf_hub_download
 
 logger = logging.getLogger(__name__)
 
 
 # ---------- Helpers ----------
+
+def _sanitize_fragment(fragment: str) -> str:
+    return fragment.replace("/", "-")
+
+
+def _dataset_cache_filename(name, split, subset, cnn_field=None, dataset_config=None):
+    parts = [name]
+    if dataset_config:
+        parts.append(_sanitize_fragment(dataset_config))
+    if cnn_field:
+        parts.append(cnn_field)
+    parts.append(split)
+    if subset is not None and subset != 1.0:
+        parts.append(str(subset))
+    return "_".join(parts) + ".pt"
+
 
 def _freeze_encoder(encoder):
     encoder.eval()
@@ -69,9 +89,165 @@ def _encode_examples(ds, tok, encoder, text_fn, max_length, keep_labels=None):
     return ds.map(_tokenize_and_encode, remove_columns=ds.column_names, batched=False)
 
 
-def build_dataset(name, split, tokenizer_name, max_length, subset=None, shuffle=False, cnn_field=None):
+FRAMENET_REPO_ID = "liyucheng/FrameNet_v17"
+FRAMENET_CONFIG_FILES = {
+    "fulltext": {
+        "train": "fn1.7/fn1.7.fulltext.train.syntaxnet.conll",
+        "validation": "fn1.7/fn1.7.dev.syntaxnet.conll",
+        "test": "fn1.7/fn1.7.test.syntaxnet.conll",
+    }
+}
+
+
+def _decode_token(raw_token: str) -> str:
+    if raw_token.startswith("b'") and raw_token.endswith("'"):
+        try:
+            value = ast.literal_eval(raw_token)
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="ignore")
+        except (SyntaxError, ValueError):
+            pass
+    return raw_token
+
+
+def _normalize_split_name(split: str) -> str:
+    mapping = {
+        "train": "train",
+        "validation": "validation",
+        "dev": "validation",
+        "val": "validation",
+        "test": "test",
+    }
+    try:
+        return mapping[split]
+    except KeyError as err:
+        raise ValueError(f"Unsupported FrameNet split: {split!r}") from err
+
+
+def _parse_framenet_conll_file(path: str):
+    examples = {
+        "tokens": [],
+        "lemmas": [],
+        "pos_tags": [],
+        "lexical_units": [],
+        "frame_elements": [],
+        "frame_name": [],
+    }
+
+    tokens = []
+    lemmas = []
+    pos_tags = []
+    lexical_units = []
+    frame_elements = []
+    frame_names_per_token = []
+
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                if tokens:
+                    examples["tokens"].append(tokens)
+                    examples["lemmas"].append(lemmas)
+                    examples["pos_tags"].append(pos_tags)
+                    examples["lexical_units"].append(lexical_units)
+                    examples["frame_elements"].append(frame_elements)
+                    frame_name = next((name for name in frame_names_per_token if name and name != "_"), "")
+                    examples["frame_name"].append(frame_name)
+                    tokens = []
+                    lemmas = []
+                    pos_tags = []
+                    lexical_units = []
+                    frame_elements = []
+                    frame_names_per_token = []
+                continue
+
+            parts = stripped.split("\t")
+            if len(parts) < 15:
+                # Malformed line or metadata; skip gracefully.
+                continue
+
+            token = _decode_token(parts[1])
+            lemma = parts[3]
+            pos_tag = parts[5]
+            lexical_unit = parts[12]
+            frame_name = parts[13]
+            frame_element = parts[14]
+
+            tokens.append(token)
+            lemmas.append(lemma)
+            pos_tags.append(pos_tag)
+            lexical_units.append(lexical_unit if lexical_unit != "_" else "")
+            if not frame_element or frame_element == "_":
+                frame_elements.append("O")
+            else:
+                frame_elements.append(frame_element)
+            frame_names_per_token.append(frame_name if frame_name != "_" else "")
+
+    if tokens:
+        examples["tokens"].append(tokens)
+        examples["lemmas"].append(lemmas)
+        examples["pos_tags"].append(pos_tags)
+        examples["lexical_units"].append(lexical_units)
+        examples["frame_elements"].append(frame_elements)
+        frame_name = next((name for name in frame_names_per_token if name and name != "_"), "")
+        examples["frame_name"].append(frame_name)
+
+    return examples
+
+
+def _load_framenet_dataset(split: str, config_name: str):
+    local_only = (
+        os.environ.get("HF_HUB_OFFLINE", "").strip() == "1"
+        or os.environ.get("HF_DATASETS_OFFLINE", "").strip() == "1"
+    )
+    normalized_split = _normalize_split_name(split)
+    config_files = FRAMENET_CONFIG_FILES.get(config_name)
+    if config_files is None:
+        available = ", ".join(sorted(FRAMENET_CONFIG_FILES))
+        raise ValueError(f"Unknown FrameNet config '{config_name}'. Available configs: {available}")
+    filename = config_files.get(normalized_split)
+    if filename is None:
+        available = ", ".join(sorted(config_files))
+        raise ValueError(
+            f"Split '{split}' (normalized to '{normalized_split}') unsupported for FrameNet config '{config_name}'. "
+            f"Available splits: {available}"
+        )
+
+    dataset_cache_root = os.environ.get("HF_DATASETS_CACHE")
+    if not dataset_cache_root:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home:
+            dataset_cache_root = os.path.join(hf_home, "datasets")
+    local_candidate = None
+    if dataset_cache_root:
+        local_candidate = os.path.join(dataset_cache_root, "liyucheng__FrameNet_v17", filename)
+        if not os.path.exists(local_candidate):
+            local_candidate = None
+    if local_candidate is not None:
+        local_path = local_candidate
+    else:
+        local_path = hf_hub_download(
+            repo_id=FRAMENET_REPO_ID,
+            filename=filename,
+            repo_type="dataset",
+            local_files_only=local_only,
+        )
+    parsed = _parse_framenet_conll_file(local_path)
+    return Dataset.from_dict(parsed)
+
+
+def build_dataset(
+    name,
+    split,
+    tokenizer_name,
+    max_length,
+    subset=None,
+    shuffle=False,
+    cnn_field=None,
+    dataset_config=None,
+):
     """
-    Generic dataset builder for CNN, WikiANN, and CoNLL.
+    Generic dataset builder for CNN, WikiANN, CoNLL, and FrameNet.
     """
     # pick dataset + text extraction strategy
     if name == "cnn":
@@ -87,6 +263,11 @@ def build_dataset(name, split, tokenizer_name, max_length, subset=None, shuffle=
         ds = load_dataset("conll2003", revision="refs/convert/parquet", split=split)
         text_fn = lambda x: " ".join(x["tokens"])
         keep_labels = ["ner_tags", "tokens"]
+    elif name == "framenet":
+        config_name = dataset_config or "fulltext"
+        ds = _load_framenet_dataset(split, config_name)
+        text_fn = lambda x: " ".join(x["tokens"])
+        keep_labels = ["tokens", "frame_elements", "frame_name", "lexical_units", "lemmas", "pos_tags"]
     else:
         raise ValueError(f"Unknown dataset name: {name}")
     
@@ -109,6 +290,8 @@ def initialize_dataloaders(cfg, logger):
         subset=cfg.data.train.subset,
         rebuild=cfg.data.rebuild_ds,
         shuffle=cfg.data.train.shuffle,
+        dataset_config=getattr(cfg.data.train, "config", None),
+        cnn_field=getattr(cfg.data.train, "cnn_field", None),
     )
     eval_shuffle = bool(cfg.data.eval.shuffle)
     if eval_shuffle:
@@ -121,6 +304,8 @@ def initialize_dataloaders(cfg, logger):
         subset=cfg.data.eval.subset,
         rebuild=cfg.data.rebuild_ds,
         shuffle=eval_shuffle,
+        dataset_config=getattr(cfg.data.eval, "config", None),
+        cnn_field=getattr(cfg.data.eval, "cnn_field", None),
     )
 
     train_dl = DataLoader(
@@ -195,21 +380,17 @@ def collate(batch):
 # ---------- Loader ----------
 
 def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
-                name="cnn", split="train", max_length=256, cnn_field=None,
-                subset=None, rebuild=False, shuffle=False):
+                name="cnn", split="train", max_length=256, dataset_config=None,
+                cnn_field=None, subset=None, rebuild=False, shuffle=False):
     
-    if cnn_field is not None:
-        if subset is not None and subset != 1.0:
-            path = f"./data/{name}_{cnn_field}_{split}_{subset}.pt"
-        else:
-            path = f"./data/{name}_{cnn_field}_{split}.pt"
-    else:
-        if subset is not None and subset != 1.0:
-            path = f"./data/{name}_{split}_{subset}.pt"
-        else:
-            path = f"./data/{name}_{split}.pt"
-
-    path = to_absolute_path(path)
+    filename = _dataset_cache_filename(
+        name,
+        split,
+        subset,
+        cnn_field=cnn_field,
+        dataset_config=dataset_config,
+    )
+    path = to_absolute_path(f"./data/{filename}")
     tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
     if rebuild:
