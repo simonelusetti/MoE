@@ -13,12 +13,12 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source "$SCRIPT_DIR/../common.sh"
+REPO_ROOT=/leonardo/home/userexternal/slusetti/MoE
+source "$REPO_ROOT/tools/slurm/common.sh"
 
-mkdir -p logs/analysis
+mkdir -p "$REPO_ROOT/logs/analysis"
 
-OUTPUT_FILE=logs/analysis/partition_framenet_${SLURM_JOB_ID}.txt
+OUTPUT_FILE=$REPO_ROOT/logs/analysis/partition_framenet_${SLURM_JOB_ID}.txt
 FRAMENET_CACHE=$HF_DATASETS_CACHE/liyucheng__FrameNet_v17
 
 python exploration/partition_analysis.py \

@@ -14,10 +14,10 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source "$SCRIPT_DIR/../common.sh"
+REPO_ROOT=/leonardo/home/userexternal/slusetti/MoE
+source "$REPO_ROOT/tools/slurm/common.sh"
 
-mkdir -p logs/datasets
+mkdir -p "$REPO_ROOT/logs/datasets"
 
 python tools/build_dataset.py \
   --dataset framenet \

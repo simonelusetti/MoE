@@ -13,10 +13,10 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source "$SCRIPT_DIR/../common.sh"
+REPO_ROOT=/leonardo/home/userexternal/slusetti/MoE
+source "$REPO_ROOT/tools/slurm/common.sh"
 
-mkdir -p logs/training
+mkdir -p "$REPO_ROOT/logs/training"
 
 # Forward any additional Hydra overrides passed to sbatch.
 dora --package src --main_module train_product run "$@"
