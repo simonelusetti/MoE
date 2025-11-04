@@ -35,7 +35,7 @@ model:
 data:
   rebuild_ds: False
   train:
-    dataset: "cnn"
+    dataset: "wikiann"
     batch_size: 32
     num_workers: 4
     subset: 1.0
