@@ -5,12 +5,7 @@ set -euo pipefail
 
 module load python/3.11.7
 
-VENV_ROOT=${VENV_ROOT:-/leonardo/home/userexternal/slusetti/.venv311}
-if [[ ! -d "$VENV_ROOT" ]]; then
-  echo "Virtualenv not found at $VENV_ROOT" >&2
-  exit 1
-fi
-source "$VENV_ROOT/bin/activate"
+source "$HOME/.venv/bin/activate"
 
 export HF_HOME=${HF_HOME:-/leonardo_work/IscrC_LUSE/slusetti/hf-cache}
 export HF_DATASETS_CACHE=$HF_HOME/datasets

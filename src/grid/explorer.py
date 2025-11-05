@@ -1,6 +1,4 @@
-"""
-Dora grid runner for Expert MoE experiments driven by a YAML sweep file.
-"""
+"""Dora grid runners for MoE experiments driven by YAML sweep files."""
 
 import itertools
 from pathlib import Path
@@ -9,11 +7,9 @@ import treetable as tt
 import yaml
 from dora import Explorer
 
-CONFIG_PATH = "grid.yaml"
 
-
-def load_yaml_sweep(path: Path):
-    """Load baseline overrides and sweep combinations from a YAML file."""
+def load_yaml_sweep(config_filename: str):
+    path = Path(__file__).resolve().parent / config_filename
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
     baseline = data.get("baseline", {})
@@ -33,8 +29,9 @@ def load_yaml_sweep(path: Path):
     return baseline, combinations
 
 
-class ExpertExplorer(Explorer):
+class BaseExplorer(Explorer):
     metric_names = ("precision", "recall", "f1")
+    factor_prefix = "expert"
 
     def get_grid_metrics(self):
         return [
@@ -49,7 +46,9 @@ class ExpertExplorer(Explorer):
         ]
 
     def process_history(self, history):
-        best_epoch, best_factor, best_metrics = summarize_best_factor(history, self.metric_names)
+        best_epoch, best_factor, best_metrics = summarize_best_factor(
+            history, self.metric_names, self.factor_prefix
+        )
         result = {
             "best": {
                 "epoch": best_epoch,
@@ -60,18 +59,35 @@ class ExpertExplorer(Explorer):
         return result
 
 
-@ExpertExplorer
-def explorer(launcher):
-    """Launch experiments defined in the YAML sweep."""
-    config_path = Path(__file__).resolve().parent / CONFIG_PATH
-    baseline, combinations = load_yaml_sweep(config_path)
+class ExpertExplorer(BaseExplorer):
+    factor_prefix = "expert"
+
+
+class ProductExplorer(BaseExplorer):
+    factor_prefix = "product"
+
+
+def run_yaml_explorer(launcher, config_filename: str):
+    baseline, combinations = load_yaml_sweep(config_filename)
     configured = launcher.bind(baseline) if baseline else launcher
 
     for overrides in combinations:
         configured(overrides)
 
 
-def summarize_best_factor(history, metric_names):
+@ExpertExplorer
+def explorer(launcher):
+    """Launch expert-model experiments defined in grid.yaml."""
+    run_yaml_explorer(launcher, "grid.yaml")
+
+
+@ProductExplorer
+def product_explorer(launcher):
+    """Launch product-model experiments defined in product.yaml."""
+    run_yaml_explorer(launcher, "product.yaml")
+
+
+def summarize_best_factor(history, metric_names, prefix: str):
     """Return (best_epoch, best_factor, metrics_dict) from Dora history."""
 
     def empty_metrics():
@@ -85,16 +101,16 @@ def summarize_best_factor(history, metric_names):
     for entry in history:
         if not isinstance(entry, dict):
             continue
-        epoch_val = entry.get("expert/best_epoch")
-        factor_val = entry.get("expert/best_factor")
-        f1_val = entry.get("expert/best_f1")
+        epoch_val = entry.get(f"{prefix}/best_epoch")
+        factor_val = entry.get(f"{prefix}/best_factor")
+        f1_val = entry.get(f"{prefix}/best_f1")
         if epoch_val is None or factor_val is None or f1_val is None:
             continue
 
         best_epoch = int(epoch_val)
         best_factor = str(factor_val)
         best_metrics["f1"] = float(f1_val)
-        factor_payload = _lookup_factor_metrics(history, best_epoch, best_factor)
+        factor_payload = _lookup_factor_metrics(history, prefix, best_epoch, best_factor)
         for name in metric_names:
             if name in factor_payload:
                 best_metrics[name] = factor_payload[name]
@@ -108,7 +124,7 @@ def summarize_best_factor(history, metric_names):
         for path, payload in entry.items():
             if not isinstance(path, str) or not isinstance(payload, dict):
                 continue
-            if not path.startswith("expert/factors/"):
+            if not path.startswith(f"{prefix}/factors/"):
                 continue
 
             epoch = _extract_epoch_from_path(path)
@@ -135,11 +151,11 @@ def _extract_epoch_from_path(path):
     return None
 
 
-def _lookup_factor_metrics(history, epoch, factor):
+def _lookup_factor_metrics(history, prefix, epoch, factor):
     """Find metrics for a specific epoch and factor inside the Dora history."""
     if epoch is None or factor is None:
         return {}
-    target_path = f"expert/factors/{epoch}"
+    target_path = f"{prefix}/factors/{epoch}"
     for entry in history:
         if not isinstance(entry, dict):
             continue

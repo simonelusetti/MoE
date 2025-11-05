@@ -10,6 +10,7 @@ from dora import get_xp, hydra_main
 
 from .data import initialize_dataloaders
 from .models import ProductManifoldModel
+from .metrics import build_eval_table
 from .utils import get_logger, should_disable_tqdm
 
 
@@ -88,6 +89,8 @@ class ProductTrainer:
             logger.info("Epoch %d eval metrics: %s", epoch + 1, eval_metrics)
             xp.link.push_metrics({f"product/eval/{epoch + 1}": eval_metrics})
             if factor_metrics:
+                eval_table = build_eval_table(factor_metrics)
+                logger.info("\nEval factor metrics (epoch %d):\n%s", epoch + 1, eval_table)
                 xp.link.push_metrics({f"product/factors/{epoch + 1}": factor_metrics})
 
             total_loss = eval_metrics.get("loss", float("inf"))
@@ -400,6 +403,8 @@ def main(cfg):
         logger.info("Eval metrics: %s", eval_metrics)
         xp.link.push_metrics({"product/eval": eval_metrics})
         if factor_metrics:
+            eval_table = build_eval_table(factor_metrics)
+            logger.info("\nEval factor metrics:\n%s", eval_table)
             xp.link.push_metrics({"product/factors": factor_metrics})
     else:
         trainer.train(train_dl, eval_dl, logger, xp)
