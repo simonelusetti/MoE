@@ -6,8 +6,8 @@ baseline:
   train.epochs: 30
 
 sweep:
-  product_model.num_subspaces: [1,2,3,4,5,6,7,8,9,10]
+  product_model.num_subspaces: [3]
   #product_model.latent_dim: [128, 256, 384]
-  #product_model.losses.geom_sparsity: [0.0, 0.01, 0.1]
-  #product_model.losses.geom_orthogonality: [0.0, 0.01, 0.1]
-  #product_model.betas.dis_spar: [0.01, 0.1, 1.0]
+  product_model.losses.geom_sparsity: [0.0, 0.01, 0.1]
+  product_model.losses.geom_orthogonality: [0.0, 0.01, 0.1]
+  product_model.betas.dis_spar: [0.01, 0.1, 1.0]

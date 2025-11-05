@@ -20,10 +20,12 @@ mkdir -p "$REPO_ROOT/logs/analysis"
 
 OUTPUT_FILE=$REPO_ROOT/logs/analysis/partition_framenet_${SLURM_JOB_ID}.txt
 FRAMENET_CACHE=$HF_DATASETS_CACHE/liyucheng__FrameNet_v17
+BUCKETS=${BUCKETS:-}
 
 python exploration/partition_analysis_framenet.py \
   --split train \
   --subset 1 \
   --model sentence-transformers/all-MiniLM-L6-v2 \
   --framenet-cache "$FRAMENET_CACHE" \
+  ${BUCKETS:+--buckets "$BUCKETS"} \
   --output "$OUTPUT_FILE"
