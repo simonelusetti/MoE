@@ -25,14 +25,18 @@ class ExpertTrainer:
     @staticmethod
     def _prepare_expert_weights(cfg):
         weights_cfg = cfg.model.loss_weights
-        return {
+        weights = {
             "sent": float(weights_cfg.sent),
             "token": float(weights_cfg.token),
             "entropy": float(weights_cfg.entropy),
             "overlap": float(weights_cfg.overlap),
             "diversity": float(weights_cfg.diversity),
             "balance": float(weights_cfg.balance),
+            "attention": float(getattr(weights_cfg, "attention", 0.0)),
         }
+        if cfg.model.expert.use_continuity:
+            weights["continuity"] = float(weights_cfg.continuity)
+        return weights
 
     def _loss(self, model, batch, device):
         embeddings = batch["embeddings"].to(device, non_blocking=True)
@@ -69,6 +73,11 @@ class ExpertTrainer:
         overlap_loss = outputs["overlap"].mean()
         diversity_loss = outputs["diversity"]
         balance_loss = outputs["balance"]
+        attention_loss = outputs.get("attention_entropy")
+        if attention_loss is not None:
+            attention_loss = attention_loss.mean()
+        else:
+            attention_loss = embeddings.new_tensor(0.0)
 
         loss_components = {
             "sent": sent_loss,
@@ -77,7 +86,13 @@ class ExpertTrainer:
             "overlap": overlap_loss,
             "diversity": diversity_loss,
             "balance": balance_loss,
+            "attention": attention_loss,
         }
+
+        if "continuity" in self.weights:
+            if "continuity" not in outputs:
+                raise KeyError("Continuity weight configured but model continuity output missing.")
+            loss_components["continuity"] = outputs["continuity"].mean()
 
         total_loss = sum(self.weights[key] * loss_components[key] for key in loss_components)
         metrics = {key: float(value.detach()) for key, value in loss_components.items()}

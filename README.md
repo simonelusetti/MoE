@@ -42,3 +42,7 @@ with non-negative weights `λ_*`.
 - Token-to-factor assignments `Pi`
 - Expert embeddings `tilde z_k`
 - Per-factor precision/recall/F1 (when labels exist)
+
+## Product-Manifold Project
+
+The token-level product-manifold projector has been extracted into its own project under `product_manifold/`. Install its requirements (`pip install -r product_manifold/requirements.txt`), build the cached datasets if needed (`python product_manifold/tools/build_dataset.py ...`), then launch training with `dora --package src --main_module train run` from inside `product_manifold`. SLURM helpers for that workflow now live in `product_manifold/tools/slurm/`.

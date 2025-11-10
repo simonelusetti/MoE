@@ -63,10 +63,6 @@ class ExpertExplorer(BaseExplorer):
     factor_prefix = "expert"
 
 
-class ProductExplorer(BaseExplorer):
-    factor_prefix = "product"
-
-
 def run_yaml_explorer(launcher, config_filename: str):
     baseline, combinations = load_yaml_sweep(config_filename)
     configured = launcher.bind(baseline) if baseline else launcher
@@ -79,12 +75,6 @@ def run_yaml_explorer(launcher, config_filename: str):
 def explorer(launcher):
     """Launch expert-model experiments defined in grid.yaml."""
     run_yaml_explorer(launcher, "grid.yaml")
-
-
-@ProductExplorer
-def product_explorer(launcher):
-    """Launch product-model experiments defined in product.yaml."""
-    run_yaml_explorer(launcher, "product.yaml")
 
 
 def summarize_best_factor(history, metric_names, prefix: str):

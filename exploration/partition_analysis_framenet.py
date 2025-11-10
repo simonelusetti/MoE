@@ -409,8 +409,7 @@ def main():
     log_line(f"Loaded {total_examples} examples from {conll_path.name} (device={device}).")
 
     rng = random.Random(args.seed)
-    results_shift: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"factor": [], "random_tokens": [], "random_factor": []})
-    results_sum: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"factor": [], "random_tokens": [], "random_factor": []})
+    results_shift: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"factor": [], "random_tokens": []})
     processed_sentences = 0
     sample_remaining = args.sample_count
 
@@ -419,12 +418,15 @@ def main():
         bucket_indices = example["bucket_indices"]
         if bucket_filter is not None:
             bucket_indices = {bucket: indices for bucket, indices in bucket_indices.items() if bucket in bucket_filter}
+        # keep only buckets that actually have token indices
+        bucket_indices = {bucket: indices for bucket, indices in bucket_indices.items() if indices}
 
-        if len(tokens) < max(args.min_length, 2) or not bucket_indices:
+        if len(tokens) < max(args.min_length, 2) or len(bucket_indices) < 2:
             continue
 
         selected_bucket = rng.choice(list(bucket_indices.keys()))
         factor_indices = bucket_indices[selected_bucket]
+        k = len(factor_indices)
         full_text = " ".join(tokens)
         if not full_text.strip():
             continue
@@ -436,18 +438,13 @@ def main():
         full_embedding = _encode_text(model, device, full_text)
         cos_kept = _cosine(model, device, full_embedding, kept_text)
         cos_removed = _cosine(model, device, full_embedding, removed_text) if removed_text.strip() else 0.0
-        factor_shift = 1.0 - cos_kept
-        factor_sum = cos_kept + cos_removed
+        factor_shift = (1.0 - cos_kept) / max(k, 1)
         results_shift[selected_bucket]["factor"].append(factor_shift)
-        results_sum[selected_bucket]["factor"].append(factor_sum)
 
         random_tokens_removed = []
-        random_factor_removed = []
-        cos_rand_kept = cos_rand_removed = rand_shift = rand_sum = None
-        cos_other_kept = cos_other_removed = other_shift = other_sum = None
+        cos_rand_kept = cos_rand_removed = rand_shift = None
 
         available_indices = sorted({idx for indices in bucket_indices.values() for idx in indices})
-        k = len(factor_indices)
         # baseline: remove same number of tokens chosen at random from factor-bearing tokens
         if len(available_indices) >= k:
             random_indices = rng.sample(available_indices, k)
@@ -457,28 +454,9 @@ def main():
             rand_removed_text = " ".join(rand_removed_tokens)
             cos_rand_kept = _cosine(model, device, full_embedding, random_text)
             cos_rand_removed = _cosine(model, device, full_embedding, rand_removed_text) if rand_removed_text.strip() else 0.0
-            rand_shift = 1.0 - cos_rand_kept
-            rand_sum = cos_rand_kept + cos_rand_removed
+            rand_shift = (1.0 - cos_rand_kept) / max(k, 1)
             results_shift[selected_bucket]["random_tokens"].append(rand_shift)
-            results_sum[selected_bucket]["random_tokens"].append(rand_sum)
             random_tokens_removed = rand_removed_tokens
-        # baseline: remove same number of tokens drawn from a different factor
-        other_buckets = [bucket for bucket, idxs in bucket_indices.items() if bucket != selected_bucket and len(idxs) >= k]
-        if other_buckets:
-            other_bucket = rng.choice(other_buckets)
-            other_indices = rng.sample(bucket_indices[other_bucket], k)
-            other_tokens = _remove_indices(tokens, other_indices)
-            other_removed_tokens = [tokens[i] for i in sorted(other_indices)]
-            other_text = " ".join(other_tokens)
-            other_removed_text = " ".join(other_removed_tokens)
-            cos_other_kept = _cosine(model, device, full_embedding, other_text)
-            cos_other_removed = _cosine(model, device, full_embedding, other_removed_text) if other_removed_text.strip() else 0.0
-            other_shift = 1.0 - cos_other_kept
-            other_sum = cos_other_kept + cos_other_removed
-            results_shift[selected_bucket]["random_factor"].append(other_shift)
-            results_sum[selected_bucket]["random_factor"].append(other_sum)
-            random_factor_removed = other_removed_tokens
-
         processed_sentences += 1
 
         if sample_remaining > 0:
@@ -491,17 +469,12 @@ def main():
                 log_line(f"  Factor '{bucket}': {removed_tokens}")
             log_line(f"  Removed factor '{selected_bucket}': {' | '.join(tokens[i] for i in factor_indices)}")
             log_line(
-                f"    cosine kept={cos_kept:.4f}, removed={cos_removed:.4f}, shift={factor_shift:.4f}, sum={factor_sum:.4f}"
+                f"    cosine kept={cos_kept:.4f}, removed={cos_removed:.4f}, shift={factor_shift:.4f}"
             )
             if random_tokens_removed:
                 log_line(f"  Random tokens removal: {' | '.join(random_tokens_removed)}")
                 log_line(
-                    f"    cosine kept={cos_rand_kept:.4f}, removed={cos_rand_removed:.4f}, shift={rand_shift:.4f}, sum={rand_sum:.4f}"
-                )
-            if random_factor_removed:
-                log_line(f"  Random factor removal: {' | '.join(random_factor_removed)}")
-                log_line(
-                    f"    cosine kept={cos_other_kept:.4f}, removed={cos_other_removed:.4f}, shift={other_shift:.4f}, sum={other_sum:.4f}"
+                    f"    cosine kept={cos_rand_kept:.4f}, removed={cos_rand_removed:.4f}, shift={rand_shift:.4f}"
                 )
 
     if processed_sentences == 0:
@@ -514,62 +487,30 @@ def main():
         "factor",
         "n_factor",
         "shift_factor",
-        "shift_rand_tokens",
+        "shift_random",
         "Δ shift",
-        "shift_rand_factor",
-        "Δ shift",
-        "sum_factor",
-        "sum_rand_tokens",
-        "Δ sum",
-        "sum_rand_factor",
-        "Δ sum",
     ]
 
     all_factor_shifts = []
     all_random_tokens_shifts = []
-    all_random_factor_shifts = []
-    all_factor_sums = []
-    all_random_tokens_sums = []
-    all_random_factor_sums = []
-
-    buckets_sorted = sorted(set(results_shift.keys()) | set(results_sum.keys()), key=_bucket_order_key)
+    buckets_sorted = sorted(results_shift.keys(), key=_bucket_order_key)
 
     def fmt(value: float | None) -> str:
         return f"{value:.4f}" if value is not None else "-"
 
     for bucket in buckets_sorted:
         shift_data = results_shift[bucket]
-        sum_data = results_sum[bucket]
 
         factor_shift_vals = shift_data["factor"]
         rand_tokens_shift_vals = shift_data["random_tokens"]
-        rand_factor_shift_vals = shift_data["random_factor"]
-
-        factor_sum_vals = sum_data["factor"]
-        rand_tokens_sum_vals = sum_data["random_tokens"]
-        rand_factor_sum_vals = sum_data["random_factor"]
 
         shift_factor_mean = _mean(factor_shift_vals)
         shift_rand_tokens_mean = _mean(rand_tokens_shift_vals)
-        shift_rand_factor_mean = _mean(rand_factor_shift_vals)
-
-        sum_factor_mean = _mean(factor_sum_vals)
-        sum_rand_tokens_mean = _mean(rand_tokens_sum_vals)
-        sum_rand_factor_mean = _mean(rand_factor_sum_vals)
 
         if shift_factor_mean is not None:
             all_factor_shifts.extend(factor_shift_vals)
         if shift_rand_tokens_mean is not None:
             all_random_tokens_shifts.extend(rand_tokens_shift_vals)
-        if shift_rand_factor_mean is not None:
-            all_random_factor_shifts.extend(rand_factor_shift_vals)
-
-        if sum_factor_mean is not None:
-            all_factor_sums.extend(factor_sum_vals)
-        if sum_rand_tokens_mean is not None:
-            all_random_tokens_sums.extend(rand_tokens_sum_vals)
-        if sum_rand_factor_mean is not None:
-            all_random_factor_sums.extend(rand_factor_sum_vals)
 
         table.add_row(
             [
@@ -582,31 +523,12 @@ def main():
                     if shift_factor_mean is not None and shift_rand_tokens_mean is not None
                     else None
                 ),
-                fmt(shift_rand_factor_mean),
-                fmt(
-                    shift_factor_mean - shift_rand_factor_mean
-                    if shift_factor_mean is not None and shift_rand_factor_mean is not None
-                    else None
-                ),
-                fmt(sum_factor_mean),
-                fmt(sum_rand_tokens_mean),
-                fmt(
-                    sum_factor_mean - sum_rand_tokens_mean
-                    if sum_factor_mean is not None and sum_rand_tokens_mean is not None
-                    else None
-                ),
-                fmt(sum_rand_factor_mean),
-                fmt(
-                    sum_factor_mean - sum_rand_factor_mean
-                    if sum_factor_mean is not None and sum_rand_factor_mean is not None
-                    else None
-                ),
             ]
         )
 
-    # report per-factor and aggregate cosine shifts/sums
+    # report per-factor and aggregate cosine shifts
     log_line("")
-    log_line("Cosine shift/sum metrics by factor removal vs baselines:")
+    log_line("Cosine shift metrics by factor removal vs random token baseline:")
     log_line(table.get_string())
 
     def fmt_overall(name: str, values: list[float]) -> str:
@@ -616,32 +538,10 @@ def main():
     log_line("Overall mean shifts:")
     log_line(fmt_overall("factor removal", all_factor_shifts))
     log_line(fmt_overall("random tokens", all_random_tokens_shifts))
-    log_line(fmt_overall("random factor", all_random_factor_shifts))
     if all_factor_shifts and all_random_tokens_shifts:
         log_line(
             f"Δ shift factor - random tokens: "
             f"{sum(all_factor_shifts) / len(all_factor_shifts) - sum(all_random_tokens_shifts) / len(all_random_tokens_shifts):.4f}"
-        )
-    if all_factor_shifts and all_random_factor_shifts:
-        log_line(
-            f"Δ shift factor - random factor: "
-            f"{sum(all_factor_shifts) / len(all_factor_shifts) - sum(all_random_factor_shifts) / len(all_random_factor_shifts):.4f}"
-        )
-
-    log_line("")
-    log_line("Overall mean cosine sums:")
-    log_line(fmt_overall("factor removal", all_factor_sums))
-    log_line(fmt_overall("random tokens", all_random_tokens_sums))
-    log_line(fmt_overall("random factor", all_random_factor_sums))
-    if all_factor_sums and all_random_tokens_sums:
-        log_line(
-            f"Δ sum factor - random tokens: "
-            f"{sum(all_factor_sums) / len(all_factor_sums) - sum(all_random_tokens_sums) / len(all_random_tokens_sums):.4f}"
-        )
-    if all_factor_sums and all_random_factor_sums:
-        log_line(
-            f"Δ sum factor - random factor: "
-            f"{sum(all_factor_sums) / len(all_factor_sums) - sum(all_random_factor_sums) / len(all_random_factor_sums):.4f}"
         )
 
     if args.output:

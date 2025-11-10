@@ -20,13 +20,19 @@ model:
     decoder_hidden: 384
     use_balance: False
     use_diversity: False
+    use_continuity: False
+    use_attention: False
+    attention_heads: 4
+    attention_dropout: 0.0
   loss_weights:
     sent: 1.0
     token: 1.0
     entropy: 0.01
     overlap: 0.01
+    continuity: 0.01
     diversity: 0.01
     balance: 0.01
+    attention: 0.0
   optim:
     lr: 5e-5
     weight_decay: 1e-2

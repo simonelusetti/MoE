@@ -12,6 +12,11 @@ from huggingface_hub import hf_hub_download
 
 logger = logging.getLogger(__name__)
 
+NER_LABEL_NAMES = {
+    "wikiann": ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"],
+    "conll2003": ["O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"],
+}
+
 
 # ---------- Helpers ----------
 
@@ -326,6 +331,13 @@ def initialize_dataloaders(cfg, logger):
         persistent_workers=(cfg.data.eval.num_workers > 0),
         shuffle=eval_shuffle,
     )
+
+    train_label_names = NER_LABEL_NAMES.get(cfg.data.train.dataset)
+    if train_label_names:
+        setattr(train_dl, "label_names", train_label_names)
+    eval_label_names = NER_LABEL_NAMES.get(cfg.data.eval.dataset)
+    if eval_label_names:
+        setattr(eval_dl, "label_names", eval_label_names)
     return train_dl, eval_dl
 
 # ---------- Collate ----------

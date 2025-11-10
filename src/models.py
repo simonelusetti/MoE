@@ -27,6 +27,8 @@ class ExpertModel(nn.Module):
         self.dropout = float(expert_cfg.dropout)
         self.use_balance = expert_cfg.use_balance
         self.use_diversity = expert_cfg.use_diversity
+        self.use_continuity = bool(expert_cfg.use_continuity)
+        self.use_attention = bool(getattr(expert_cfg, "use_attention", False))
 
         self.sbert = SentenceTransformer(cfg.sbert_name)
         self.pooler = self.sbert[1]
@@ -35,6 +37,23 @@ class ExpertModel(nn.Module):
         factor_dim = int(expert_cfg.factor_dim)
         factor_hidden = int(expert_cfg.factor_hidden)
         self.factor_dim = factor_dim
+        if self.use_attention:
+            attn_heads = int(getattr(expert_cfg, "attention_heads", 1))
+            attn_dropout = float(getattr(expert_cfg, "attention_dropout", 0.0))
+            if factor_dim % attn_heads != 0:
+                raise ValueError(
+                    "expert.factor_dim must be divisible by attention_heads when attention is enabled."
+                )
+            self.expert_attention = nn.MultiheadAttention(
+                embed_dim=factor_dim,
+                num_heads=attn_heads,
+                dropout=attn_dropout,
+                batch_first=True,
+            )
+            self.attention_layer_norm = nn.LayerNorm(factor_dim)
+        else:
+            self.expert_attention = None
+            self.attention_layer_norm = None
 
         gate_hidden = int(expert_cfg.gate_hidden)
         gate_dropout = float(expert_cfg.gate_dropout)
@@ -159,6 +178,20 @@ class ExpertModel(nn.Module):
         if self.normalize_factors:
             factors_raw = factors_raw / mass
         transformed_factors = self._transform_factors(factors_raw)
+        if self.expert_attention is not None:
+            attn_output, attn_weights = self.expert_attention(
+                transformed_factors,
+                transformed_factors,
+                transformed_factors,
+                need_weights=True,
+            )
+            transformed_factors = self.attention_layer_norm(transformed_factors + attn_output)
+            attn_weights_safe = attn_weights.clamp_min(self.small_value)
+            attention_entropy = -(attn_weights_safe * attn_weights_safe.log()).sum(dim=-1)
+            attention_entropy = attention_entropy.mean(dim=-1)
+        else:
+            attn_weights = None
+            attention_entropy = transformed_factors.new_zeros(transformed_factors.size(0))
 
         pooled = self.pooler(
             {
@@ -184,6 +217,18 @@ class ExpertModel(nn.Module):
         overlap = 0.5 * (1.0 - pi_sq)
         overlap = (overlap * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
 
+        continuity = None
+        if self.use_continuity:
+            if routing_weights.size(1) > 1:
+                pair_mask = mask_float[:, 1:] * mask_float[:, :-1]
+                diff = routing_weights[:, 1:, :] - routing_weights[:, :-1, :]
+                diff_sq = diff.pow(2).sum(dim=-1)
+                numerator = (diff_sq * pair_mask).sum(dim=1)
+                denominator = pair_mask.sum(dim=1).clamp_min(self.small_value)
+                continuity = numerator / denominator
+            else:
+                continuity = routing_weights.new_zeros(routing_weights.size(0))
+
         if self.use_balance:
             expert_mass = routing_weights.sum(dim=1)
             total_tokens = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -198,7 +243,7 @@ class ExpertModel(nn.Module):
         else:
             diversity = routing_weights.new_zeros(())
 
-        return {
+        outputs = {
             "pi": routing_weights,
             "factors_raw": factors_raw,
             "factors": transformed_factors,
@@ -209,106 +254,10 @@ class ExpertModel(nn.Module):
             "overlap": overlap,
             "balance": balance,
             "diversity": diversity,
+            "attention_entropy": attention_entropy,
         }
-
-
-class ProductProjector(nn.Module):
-    """Feed-forward projection module used to isolate latent subspaces."""
-
-    def __init__(self, latent_dim: int, hidden_dim: int):
-        super().__init__()
-        layers = []
-        if hidden_dim > 0:
-            layers.append(nn.Linear(latent_dim, hidden_dim))
-            layers.append(nn.GELU())
-            layers.append(nn.Linear(hidden_dim, latent_dim))
-        else:
-            layers.append(nn.Linear(latent_dim, latent_dim))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class ProductManifoldModel(nn.Module):
-    """Token-level product-manifold projection module."""
-
-    def __init__(self, cfg, input_dim: int):
-        super().__init__()
-        self.cfg = cfg
-        model_cfg = cfg.product_model
-        latent_dim = int(model_cfg.latent_dim)
-        hidden = int(model_cfg.encoder_hidden)
-        projector_hidden = int(model_cfg.projector_hidden)
-        self.num_subspaces = int(model_cfg.num_subspaces)
-
-        if self.num_subspaces < 1:
-            raise ValueError("product_model.num_subspaces must be >= 1")
-
-        self.latent_dim = latent_dim
-        self.encoder = self._build_mlp(input_dim, hidden, latent_dim)
-        self.token_decoder = self._build_mlp(latent_dim, hidden, input_dim)
-        self.projectors = nn.ModuleList(
-            ProductProjector(latent_dim, projector_hidden) for _ in range(self.num_subspaces)
-        )
-
-    @staticmethod
-    def _build_mlp(input_dim: int, hidden_dim: int, output_dim: int) -> nn.Module:
-        layers = []
-        if hidden_dim > 0:
-            layers.extend(
-                [
-                    nn.Linear(input_dim, hidden_dim),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim, output_dim),
-                ]
-            )
-        else:
-            layers.append(nn.Linear(input_dim, output_dim))
-        return nn.Sequential(*layers)
-
-    def _encode_latents(
-        self, token_embeddings: torch.Tensor, mask: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        z_hat = self.encoder(token_embeddings)
-        projected = [proj(z_hat) for proj in self.projectors]
-        subspaces = torch.stack(projected, dim=2)  # [B, T, K, D]
-        aggregated = subspaces.sum(dim=2)  # [B, T, D]
-        aggregated = aggregated * mask.unsqueeze(-1).type_as(aggregated)
-
-        mask_float = mask.unsqueeze(-1).unsqueeze(-1).type_as(subspaces)
-        masked_subspaces = subspaces * mask_float
-        token_counts = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        factor_means = masked_subspaces.sum(dim=1) / token_counts.unsqueeze(-1)
-
-        return {
-            "z_hat": z_hat,
-            "subspaces": subspaces,
-            "aggregated_tokens": aggregated,
-            "factors": factor_means,
-        }
-
-    def decode_tokens(self, aggregated_tokens: torch.Tensor) -> torch.Tensor:
-        return self.token_decoder(aggregated_tokens)
-
-    def forward(self, token_embeddings: torch.Tensor, mask: torch.Tensor) -> dict[str, torch.Tensor]:
-        latents = self._encode_latents(token_embeddings, mask)
-        token_reconstruction = self.decode_tokens(latents["aggregated_tokens"])
-
-        mask_float = mask.unsqueeze(-1).type_as(token_reconstruction)
-        sentence_reconstruction = (
-            (token_reconstruction * mask_float).sum(dim=1)
-            / mask_float.sum(dim=1).clamp_min(1.0)
-        )
-
-        latents.update(
-            {
-                "token_reconstruction": token_reconstruction,
-                "sentence_reconstruction": sentence_reconstruction,
-                "mask": mask,
-            }
-        )
-        return latents
-
-    def encode_tokens(self, token_embeddings: torch.Tensor, mask: torch.Tensor) -> dict[str, torch.Tensor]:
-        return self._encode_latents(token_embeddings, mask)
+        if self.use_continuity:
+            outputs["continuity"] = continuity
+        if attn_weights is not None:
+            outputs["attention_weights"] = attn_weights
+        return outputs
