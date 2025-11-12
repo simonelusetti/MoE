@@ -18,9 +18,9 @@ model:
     reconstruction_hidden: 0
     use_token_decoder: False
     decoder_hidden: 384
-    use_balance: False
-    use_diversity: False
-    use_continuity: False
+    use_balance: True
+    use_diversity: True
+    use_continuity: True
     use_attention: False
     attention_heads: 4
     attention_dropout: 0.0
@@ -42,12 +42,14 @@ data:
   rebuild_ds: False
   train:
     dataset: "wikiann"
+    config: null
     batch_size: 32
     num_workers: 4
     subset: 1.0
     shuffle: True
   eval:
     dataset: "wikiann"
+    config: null
     batch_size: 32
     num_workers: 1
     subset: 1.0
@@ -60,6 +62,7 @@ train:
 eval:
   eval_only: False
   metrics_only: True
+  factor_threshold: null
 
 device: "cuda"
 

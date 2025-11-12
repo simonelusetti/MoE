@@ -154,6 +154,9 @@ class ExpertTrainer:
     def train(self, cfg, logger, train_dl, eval_dl, xp):
         device = cfg.device
         model = ExpertModel(cfg.model).to(device)
+        factor_threshold = getattr(cfg.eval, "factor_threshold", None)
+        if factor_threshold is not None:
+            factor_threshold = float(factor_threshold)
 
         optim_cfg = cfg.model.optim
         optimizer = torch.optim.AdamW(
@@ -195,8 +198,7 @@ class ExpertTrainer:
                 desc=f"Expert Eval {epoch + 1}",
                 disable_progress=False,
             )
-            factor_metrics = evaluate_factor_metrics(model, eval_dl, device, logger)
-
+            factor_metrics = evaluate_factor_metrics(model, eval_dl, device, logger, threshold=factor_threshold)
             eval_table = build_eval_table(factor_metrics)
             logger.info("\nEval factor metrics (epoch %d):\n%s", epoch + 1, eval_table)
 
@@ -236,6 +238,9 @@ class ExpertTrainer:
     def evaluate(self, cfg, logger, eval_dl, xp):
         device = cfg.device
         model = ExpertModel(cfg.model).to(device)
+        factor_threshold = getattr(cfg.eval, "factor_threshold", None)
+        if factor_threshold is not None:
+            factor_threshold = float(factor_threshold)
         checkpoint_path = "expert_model.pth"
         self._load_checkpoint(model, checkpoint_path, device, logger)
 
@@ -247,7 +252,7 @@ class ExpertTrainer:
             desc="Expert Evaluation",
             disable_progress=False,
         )
-        factor_metrics = evaluate_factor_metrics(model, eval_dl, device, logger)
+        factor_metrics = evaluate_factor_metrics(model, eval_dl, device, logger, threshold=factor_threshold)
 
         loss_table = build_train_table(eval_metrics, model=model, weights=self.weights)
         logger.info("\nEval loss metrics:\n%s", loss_table)

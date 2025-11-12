@@ -96,7 +96,11 @@ def _prepare_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=("cnn", "wikiann", "conll2003", "framenet"), required=True)
+    parser.add_argument(
+        "--dataset",
+        choices=("cnn", "wikiann", "conll2003", "wnut", "ontonotes", "bc2gm", "framenet"),
+        required=True,
+    )
     parser.add_argument("--splits", nargs="+", default=["train"], help="Dataset splits to prepare (default: %(default)s)")
     parser.add_argument("--subset", default=None, help="Subset value matching src.data expectations (e.g. 0.1, 1000, None)")
     parser.add_argument("--tokenizer", default="sentence-transformers/all-MiniLM-L6-v2", help="Tokenizer/model id to use")
@@ -119,8 +123,11 @@ def main() -> None:
     if args.dataset == "cnn" and cnn_field is None:
         cnn_field = "highlights"
     dataset_config = args.config
-    if args.dataset == "framenet" and dataset_config is None:
-        dataset_config = "fulltext"
+    if args.dataset == "framenet":
+        if dataset_config is None:
+            dataset_config = "fulltext"
+    elif args.dataset == "ontonotes" and dataset_config is None:
+        dataset_config = "english_v4"
 
     prepared = []
     for split in args.splits:

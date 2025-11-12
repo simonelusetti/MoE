@@ -2,6 +2,7 @@
 __pycache__/
 data
 data/*
+.dataset_downloads/
 outputs/
 outputs
 outputs_grids/

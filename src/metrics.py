@@ -13,10 +13,6 @@ def filter_metric(name, value, *, model=None, weights=None):
         return False
     if not math.isfinite(value):
         return False
-    if weights is not None:
-        weight = weights.get(name)
-        if weight is not None and abs(weight) < 1e-12:
-            return False
     if model is not None:
         if name == "balance" and getattr(model, "use_balance", True) is False:
             return False
@@ -91,6 +87,8 @@ def build_eval_table(factor_metrics):
             row.append(f"{f1_value:.4f}")
         table.add_row(row)
     return table.get_string()
+
+
 def _require_ner_tags(batch, *, logger=None):
     if "ner_tags" in batch:
         return True
@@ -99,7 +97,7 @@ def _require_ner_tags(batch, *, logger=None):
     return False
 
 
-def evaluate_factor_metrics(model, loader, device, logger=None):
+def evaluate_factor_metrics(model, loader, device, logger=None, threshold: float | None = None):
     model.eval()
     num_factors = model.num_experts
     stats = [dict(tp=0, fp=0, fn=0) for _ in range(num_factors)]
@@ -130,12 +128,19 @@ def evaluate_factor_metrics(model, loader, device, logger=None):
                 outgoing = outgoing.to(device, non_blocking=True)
 
             outputs = model(embeddings, attention_mask, incoming, outgoing)
-            routing = outputs["pi"].argmax(dim=-1)
+            routing_scores = outputs["pi"]
+            max_scores, routing = routing_scores.max(dim=-1)
 
             valid = attention_mask > 0
             gold = (ner_tags > 0) & valid
+            strong = max_scores >= threshold if threshold is not None else None
 
-            factor_preds = [(routing == idx) & valid for idx in range(num_factors)]
+            factor_preds = []
+            for idx in range(num_factors):
+                pred = (routing == idx) & valid
+                if strong is not None:
+                    pred = pred & strong
+                factor_preds.append(pred)
 
             gold_by_class = {}
             if label_groups:
