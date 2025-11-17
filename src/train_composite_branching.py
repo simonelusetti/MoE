@@ -83,8 +83,18 @@ class BranchingCompositeTrainer:
         self.leaf_dev_metrics: dict[str, dict[str, float]] = {}
         self.dev_eval_top_k = 10
 
-        selector_params = [param for node in self.nodes for param in node.selector.parameters()]
-        expert_params = [param for node in self.nodes for param in node.expert.parameters()]
+        selector_params = [
+            param
+            for node in self.nodes
+            for param in node.selector.parameters()
+            if param.requires_grad
+        ]
+        expert_params = [
+            param
+            for node in self.nodes
+            for param in node.expert.parameters()
+            if param.requires_grad
+        ]
         self.selector_params = selector_params
         self.expert_params = expert_params
 
@@ -314,19 +324,21 @@ class BranchingCompositeTrainer:
         if mask.sum() == 0:
             return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
 
-        selector_loss, selector_metrics, selector_out = self._selector_forward(
-            node.selector, embeddings, mask
-        )
-        update_epoch_metrics(selector_sums, selector_counts, selector_metrics)
+        context = torch.enable_grad if (training and node.trainable) else torch.no_grad
+        with context():
+            selector_loss, selector_metrics, selector_out = self._selector_forward(
+                node.selector, embeddings, mask
+            )
+            update_epoch_metrics(selector_sums, selector_counts, selector_metrics)
 
-        selection_mask = self._build_selection_mask(selector_out["gates"], mask)
-        selected_embeddings = embeddings * selection_mask.unsqueeze(-1)
-        selected_mask = (mask * selection_mask.long()).clamp(max=1)
+            selection_mask = self._build_selection_mask(selector_out["gates"], mask)
+            selected_embeddings = embeddings * selection_mask.unsqueeze(-1)
+            selected_mask = (mask * selection_mask.long()).clamp(max=1)
 
-        expert_loss, expert_metrics, expert_out = self._expert_forward(
-            node.expert, selected_embeddings, selected_mask
-        )
-        update_epoch_metrics(expert_sums, expert_counts, expert_metrics)
+            expert_loss, expert_metrics, expert_out = self._expert_forward(
+                node.expert, selected_embeddings, selected_mask
+            )
+            update_epoch_metrics(expert_sums, expert_counts, expert_metrics)
 
         selector_total = selector_loss
         expert_total = expert_loss
@@ -488,7 +500,7 @@ class BranchingCompositeTrainer:
 
     def _set_mode(self, train: bool):
         for node in self.nodes:
-            if train:
+            if train and node.trainable:
                 node.selector.train()
                 node.expert.train()
             else:

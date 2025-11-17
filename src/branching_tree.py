@@ -20,6 +20,7 @@ class BranchNode:
     selector: RationaleSelectorModel
     expert: ExpertModel
     children: list["BranchNode"] = field(default_factory=list)
+    trainable: bool = True
 
 
 @dataclass
@@ -65,6 +66,7 @@ def build_branch_tree(
 ):
     selector_pooler_template, selector_hidden_dim, selector_null_embedding = selector_backbone
     expert_pooler_template, expert_hidden_dim = expert_backbone
+    nodes: list[BranchNode] = []
     path_to_node: dict[tuple[int, ...], BranchNode] = {}
     leaf_name_to_path: dict[str, tuple[int, ...]] = {}
 
@@ -84,8 +86,22 @@ def build_branch_tree(
             pooler=expert_pooler,
             embedding_dim=expert_hidden_dim,
         ).to(device)
-        node = BranchNode(stage=stage, path=path, selector=selector, expert=expert, children=[])
+        trainable = stage == num_stages - 1
+        node = BranchNode(
+            stage=stage,
+            path=path,
+            selector=selector,
+            expert=expert,
+            children=[],
+            trainable=trainable,
+        )
+        if not trainable:
+            for param in node.selector.parameters():
+                param.requires_grad_(False)
+            for param in node.expert.parameters():
+                param.requires_grad_(False)
         path_to_node[path] = node
+        nodes.append(node)
         if stage + 1 < num_stages:
             for idx in range(num_factors):
                 child_path = path + (idx,)
@@ -94,7 +110,6 @@ def build_branch_tree(
         return node
 
     root = _build(0, tuple())
-    nodes = list(path_to_node.values())
     return root, nodes, path_to_node, leaf_name_to_path
 
 
@@ -333,8 +348,8 @@ def evaluate_leaf_on_loader(trainer, leaf_name, loader, logger, tag: str | None 
                     if not child_bool.any():
                         cur_mask = cur_mask.new_zeros(cur_mask.shape)
                         break
-                        cur_embeddings = cur_embeddings * child_bool.unsqueeze(-1).to(cur_embeddings.dtype)
-                        cur_mask = child_bool.long()
+                    cur_embeddings = cur_embeddings * child_bool.unsqueeze(-1).to(cur_embeddings.dtype)
+                    cur_mask = child_bool.long()
                 else:
                     valid = cur_mask > 0
                     if not valid.any():
