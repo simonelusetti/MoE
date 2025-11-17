@@ -12,7 +12,7 @@ class ExpertModel(nn.Module):
     and reconstructs the anchor sentence embedding (and optionally token states).
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, pooler=None, embedding_dim=None):
         super().__init__()
         self.cfg = cfg
         expert_cfg = cfg.expert
@@ -30,9 +30,14 @@ class ExpertModel(nn.Module):
         self.use_continuity = bool(expert_cfg.use_continuity)
         self.use_attention = bool(expert_cfg.use_attention)
 
-        self.sbert = SentenceTransformer(cfg.sbert_name)
-        self.pooler = self.sbert[1]
-        enc_hidden = self.sbert[0].auto_model.config.hidden_size
+        if pooler is not None and embedding_dim is not None:
+            self.sbert = None
+            self.pooler = pooler
+            enc_hidden = int(embedding_dim)
+        else:
+            self.sbert = SentenceTransformer(cfg.sbert_name)
+            self.pooler = self.sbert[1]
+            enc_hidden = self.sbert[0].auto_model.config.hidden_size
 
         factor_dim = int(expert_cfg.factor_dim)
         factor_hidden = int(expert_cfg.factor_hidden)

@@ -1,7 +1,6 @@
 import os
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -17,23 +16,28 @@ if _RATCON_ROOT.exists() and str(_RATCON_ROOT) not in sys.path:
     sys.path.append(str(_RATCON_ROOT))
 
 from ratcon.losses import complement_loss, sparsity_loss as rat_sparsity_loss, total_variation_1d
-from ratcon.models import RationaleSelectorModel, nt_xent
+from ratcon.models import nt_xent
 
+from .branching_tree import (
+    BranchNode,
+    accumulate_leaf_stats,
+    best_leaf,
+    build_branch_tree,
+    evaluate_leaf_on_loader,
+    finalize_leaf_metrics,
+    log_f1_table,
+    log_leaf_ranking,
+    prepare_batch,
+    prepare_expert_backbone,
+    prepare_selector_backbone,
+    sorted_leaves,
+    update_epoch_metrics,
+)
 from .data import initialize_dataloaders
-from .metrics import build_eval_table, _build_label_groups
-from .models import ExpertModel
+from .metrics import _build_label_groups
 from .utils import configure_runtime, get_logger, should_disable_tqdm
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-
-@dataclass
-class BranchNode:
-    stage: int
-    path: tuple[int, ...]
-    selector: RationaleSelectorModel
-    expert: ExpertModel
-    children: list["BranchNode"] = field(default_factory=list)
 
 
 class BranchingCompositeTrainer:
@@ -60,10 +64,22 @@ class BranchingCompositeTrainer:
 
         self.contrastive_tau = float(self.model_cfg.contrastive_tau)
 
-        self.path_to_node: dict[tuple[int, ...], BranchNode] = {}
-        self.leaf_name_to_path: dict[str, tuple[int, ...]] = {}
-        self.root = self._build_tree(stage=0, path=tuple())
-        self.nodes = list(self.path_to_node.values())
+        selector_backbone = prepare_selector_backbone(self.selector_cfg)
+        expert_backbone = prepare_expert_backbone(self.model_cfg)
+        (
+            self.root,
+            self.nodes,
+            self.path_to_node,
+            self.leaf_name_to_path,
+        ) = build_branch_tree(
+            self.selector_cfg,
+            self.model_cfg,
+            self.num_stages,
+            self.num_factors,
+            self.device,
+            selector_backbone,
+            expert_backbone,
+        )
         self.leaf_dev_metrics: dict[str, dict[str, float]] = {}
         self.dev_eval_top_k = 10
 
@@ -88,66 +104,12 @@ class BranchingCompositeTrainer:
             betas=exp_optim_cfg.betas,
         )
 
-    def _build_tree(self, stage: int, path: tuple[int, ...]) -> BranchNode:
-        selector = RationaleSelectorModel(self.selector_cfg).to(self.device)
-        expert = ExpertModel(self.model_cfg).to(self.device)
-        node = BranchNode(stage=stage, path=path, selector=selector, expert=expert, children=[])
-        self.path_to_node[path] = node
-        if stage + 1 < self.num_stages:
-            for idx in range(self.num_factors):
-                child_path = path + (idx,)
-                child = self._build_tree(stage + 1, child_path)
-                node.children.append(child)
-        return node
-
     def train(self, train_dl, eval_dl, dev_dl, logger, xp):
         disable_progress = should_disable_tqdm()
         best_eval = float("inf")
 
         for epoch in range(self.cfg.train.epochs):
-            selector_sums = defaultdict(float)
-            selector_counts = defaultdict(int)
-            expert_sums = defaultdict(float)
-            expert_counts = defaultdict(int)
-
-            self._set_mode(train=True)
-
-            iterator = tqdm(train_dl, desc=f"Branch Composite Train {epoch + 1}", disable=disable_progress)
-            for batch in iterator:
-                embeddings = batch["embeddings"].to(self.device, non_blocking=True)
-                attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
-                incoming = batch.get("incoming")
-                outgoing = batch.get("outgoing")
-                if incoming is not None:
-                    incoming = incoming.to(self.device, non_blocking=True)
-                if outgoing is not None:
-                    outgoing = outgoing.to(self.device, non_blocking=True)
-
-                selector_loss, expert_loss = self._forward_batch(
-                    embeddings,
-                    attention_mask,
-                    incoming,
-                    outgoing,
-                    selector_sums,
-                    selector_counts,
-                    expert_sums,
-                    expert_counts,
-                    training=True,
-                )
-
-                total_loss = self.selector_weight * selector_loss + self.expert_weight * expert_loss
-
-                self.selector_optimizer.zero_grad(set_to_none=True)
-                self.expert_optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.selector_params, self.grad_clip)
-                    torch.nn.utils.clip_grad_norm_(self.expert_params, self.grad_clip)
-                self.selector_optimizer.step()
-                self.expert_optimizer.step()
-
-            selector_avg = {k: selector_sums[k] / max(selector_counts[k], 1) for k in selector_sums}
-            expert_avg = {k: expert_sums[k] / max(expert_counts[k], 1) for k in expert_sums}
+            selector_avg, expert_avg = self._run_train_epoch(train_dl, disable_progress, epoch)
 
             self._log_metrics_table(f"Selector Train (epoch {epoch + 1})", selector_avg, logger)
             self._log_metrics_table(f"Expert Train (epoch {epoch + 1})", expert_avg, logger)
@@ -161,30 +123,28 @@ class BranchingCompositeTrainer:
             selector_eval = eval_results["selector_avg"]
             expert_eval = eval_results["expert_avg"]
             leaf_metrics = eval_results["leaf_metrics"]
-            sorted_leaves = self._sorted_leaves(leaf_metrics)
+            ranked_leaves = sorted_leaves(leaf_metrics)
 
             self._log_metrics_table(f"Selector Eval (epoch {epoch + 1})", selector_eval, logger)
             self._log_metrics_table(f"Expert Eval (epoch {epoch + 1})", expert_eval, logger)
-            self._log_f1_table(f"Leaf Factors Eval (epoch {epoch + 1})", leaf_metrics, logger)
+            log_f1_table(f"Leaf Factors Eval (epoch {epoch + 1})", leaf_metrics, logger)
 
             xp.link.push_metrics({f"branch/eval_selector/{epoch + 1}": selector_eval})
             xp.link.push_metrics({f"branch/eval_expert/{epoch + 1}": expert_eval})
-            best_eval_leaf = self._best_leaf(leaf_metrics)
+            best_eval_leaf = best_leaf(leaf_metrics)
             if best_eval_leaf:
                 best_leaf_name, best_leaf_stats = best_eval_leaf
                 xp.link.push_metrics({f"branch/eval_leaf/{epoch + 1}": {best_leaf_name: best_leaf_stats}})
 
             if dev_dl is not None:
                 epoch_dev_metrics = {}
-                for leaf, _ in sorted_leaves[: self.dev_eval_top_k]:
-                    dev_metrics = self._evaluate_leaf_on_loader(
-                        leaf, dev_dl, logger, tag=f"epoch {epoch + 1}"
-                    )
+                for leaf, _ in ranked_leaves[: self.dev_eval_top_k]:
+                    dev_metrics = evaluate_leaf_on_loader(self, leaf, dev_dl, logger, tag=f"epoch {epoch + 1}")
                     if dev_metrics:
                         self.leaf_dev_metrics[leaf] = dev_metrics
                         epoch_dev_metrics[leaf] = dev_metrics
                 if epoch_dev_metrics:
-                    best_dev_leaf = self._best_leaf(epoch_dev_metrics)
+                    best_dev_leaf = best_leaf(epoch_dev_metrics)
                     if best_dev_leaf:
                         dev_leaf_name, dev_leaf_stats = best_dev_leaf
                         xp.link.push_metrics({f"branch/dev_leaf/{epoch + 1}": {dev_leaf_name: dev_leaf_stats}})
@@ -200,13 +160,13 @@ class BranchingCompositeTrainer:
                         )
                         logger.info("\nBest dev leaf (epoch %d):\n%s", epoch + 1, table.get_string())
 
-            self._log_leaf_ranking(
+            log_leaf_ranking(
                 title=f"Leaf Factors Eval (epoch {epoch + 1})",
                 metrics_dict=leaf_metrics,
                 logger=logger,
                 top_k=self.dev_eval_top_k,
                 dev_metrics=self.leaf_dev_metrics,
-                sorted_items=sorted_leaves,
+                sorted_items=ranked_leaves,
             )
 
             total_eval_loss = selector_eval.get("total", 0.0) + expert_eval.get("total", 0.0)
@@ -216,6 +176,48 @@ class BranchingCompositeTrainer:
 
         if eval_dl is None:
             self._save_checkpoint(logger)
+
+    def _run_train_epoch(self, loader, disable_progress, epoch_index: int):
+        selector_sums = defaultdict(float)
+        selector_counts = defaultdict(int)
+        expert_sums = defaultdict(float)
+        expert_counts = defaultdict(int)
+
+        self._set_mode(train=True)
+
+        iterator = tqdm(
+            loader,
+            desc=f"Branch Composite Train {epoch_index + 1}",
+            disable=disable_progress,
+        )
+        for batch in iterator:
+            tensors = prepare_batch(batch, self.device)
+            selector_loss, expert_loss = self._forward_batch(
+                tensors.embeddings,
+                tensors.attention_mask,
+                tensors.incoming,
+                tensors.outgoing,
+                selector_sums,
+                selector_counts,
+                expert_sums,
+                expert_counts,
+                training=True,
+            )
+
+            total_loss = self.selector_weight * selector_loss + self.expert_weight * expert_loss
+
+            self.selector_optimizer.zero_grad(set_to_none=True)
+            self.expert_optimizer.zero_grad(set_to_none=True)
+            total_loss.backward()
+            if self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.selector_params, self.grad_clip)
+                torch.nn.utils.clip_grad_norm_(self.expert_params, self.grad_clip)
+            self.selector_optimizer.step()
+            self.expert_optimizer.step()
+
+        selector_avg = {k: selector_sums[k] / max(selector_counts[k], 1) for k in selector_sums}
+        expert_avg = {k: expert_sums[k] / max(expert_counts[k], 1) for k in expert_sums}
+        return selector_avg, expert_avg
 
     def evaluate(self, loader, logger, log_to_xp: bool = True):
         disable_progress = should_disable_tqdm(metrics_only=True)
@@ -233,29 +235,18 @@ class BranchingCompositeTrainer:
         with torch.no_grad():
             iterator = tqdm(loader, desc="Branch Composite Eval", disable=disable_progress)
             for batch in iterator:
-                embeddings = batch["embeddings"].to(self.device, non_blocking=True)
-                attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
-                incoming = batch.get("incoming")
-                outgoing = batch.get("outgoing")
-                ner_tags = batch.get("ner_tags")
-                if incoming is not None:
-                    incoming = incoming.to(self.device, non_blocking=True)
-                if outgoing is not None:
-                    outgoing = outgoing.to(self.device, non_blocking=True)
-                if ner_tags is not None:
-                    ner_tags = ner_tags.to(self.device, non_blocking=True)
-
+                tensors = prepare_batch(batch, self.device, require_labels=True)
                 self._forward_batch(
-                    embeddings,
-                    attention_mask,
-                    incoming,
-                    outgoing,
+                    tensors.embeddings,
+                    tensors.attention_mask,
+                    tensors.incoming,
+                    tensors.outgoing,
                     selector_sums,
                     selector_counts,
                     expert_sums,
                     expert_counts,
                     training=False,
-                    ner_tags=ner_tags,
+                    ner_tags=tensors.ner_tags,
                     leaf_stats=leaf_stats,
                     leaf_per_class=leaf_per_class,
                     label_groups=label_groups,
@@ -263,7 +254,7 @@ class BranchingCompositeTrainer:
 
         selector_avg = {k: selector_sums[k] / max(selector_counts[k], 1) for k in selector_sums}
         expert_avg = {k: expert_sums[k] / max(expert_counts[k], 1) for k in expert_sums}
-        leaf_metrics = self._finalize_leaf_metrics(leaf_stats, leaf_per_class, label_groups)
+        leaf_metrics = finalize_leaf_metrics(leaf_stats, leaf_per_class, label_groups)
 
         if log_to_xp:
             return {
@@ -336,9 +327,7 @@ class BranchingCompositeTrainer:
         selector_loss, selector_metrics, selector_out = self._selector_forward(
             node.selector, embeddings, mask, incoming, outgoing
         )
-        for name, value in selector_metrics.items():
-            selector_sums[name] += value
-            selector_counts[name] += 1
+        update_epoch_metrics(selector_sums, selector_counts, selector_metrics)
 
         selection_mask = self._build_selection_mask(selector_out["gates"], mask)
         selected_embeddings = embeddings * selection_mask.unsqueeze(-1)
@@ -349,9 +338,7 @@ class BranchingCompositeTrainer:
         expert_loss, expert_metrics, expert_out = self._expert_forward(
             node.expert, selected_embeddings, selected_mask, selected_incoming, selected_outgoing
         )
-        for name, value in expert_metrics.items():
-            expert_sums[name] += value
-            expert_counts[name] += 1
+        update_epoch_metrics(expert_sums, expert_counts, expert_metrics)
 
         selector_total = selector_loss
         expert_total = expert_loss
@@ -391,7 +378,9 @@ class BranchingCompositeTrainer:
                 expert_total = expert_total + c_exp
         else:
             if ner_tags is not None and leaf_stats is not None:
-                self._accumulate_leaf_stats(
+                accumulate_leaf_stats(
+                    self.leaf_name_to_path,
+                    self.num_factors,
                     leaf_stats,
                     leaf_per_class,
                     expert_out["pi"],
@@ -517,93 +506,6 @@ class BranchingCompositeTrainer:
             selection = selection * mask_float
         return selection
 
-    def _leaf_factor_name(self, path: tuple[int, ...], factor_idx: int) -> str:
-        full_path = path + (factor_idx,)
-        suffix = "_".join(str(idx) for idx in full_path) or "root"
-        name = f"leaf_{suffix}"
-        self.leaf_name_to_path.setdefault(name, full_path)
-        return name
-
-    def _accumulate_leaf_stats(
-        self,
-        stats_dict,
-        per_class_stats,
-        routing,
-        mask,
-        ner_tags,
-        path,
-        label_groups,
-    ):
-        valid = mask > 0
-        if ner_tags is None:
-            return
-        gold = (ner_tags > 0) & valid
-        predictions = routing.argmax(dim=-1)
-
-        for idx in range(self.num_factors):
-            name = self._leaf_factor_name(path, idx)
-            pred_idx = (predictions == idx) & valid
-            tp = (pred_idx & gold).sum().item()
-            fp = (pred_idx & (~gold)).sum().item()
-            fn = ((~pred_idx) & gold).sum().item()
-
-            leaf_counts = stats_dict.setdefault(name, dict(tp=0, fp=0, fn=0))
-            leaf_counts["tp"] += tp
-            leaf_counts["fp"] += fp
-            leaf_counts["fn"] += fn
-
-            if label_groups and per_class_stats is not None:
-                label_map = per_class_stats.setdefault(
-                    name, {label: dict(tp=0, fp=0, fn=0) for label in label_groups.keys()}
-                )
-                for label, indices in label_groups.items():
-                    class_mask = torch.zeros_like(valid, dtype=torch.bool)
-                    for label_id in indices:
-                        class_mask |= ner_tags == label_id
-                    class_mask = class_mask & valid
-                    tp_c = (pred_idx & class_mask).sum().item()
-                    fp_c = (pred_idx & (~class_mask)).sum().item()
-                    fn_c = ((~pred_idx) & class_mask).sum().item()
-                    label_counts = label_map[label]
-                    label_counts["tp"] += tp_c
-                    label_counts["fp"] += fp_c
-                    label_counts["fn"] += fn_c
-
-    def _finalize_leaf_metrics(self, stats_dict, per_class_stats, label_groups):
-        results = {}
-        for name, counts in stats_dict.items():
-            tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-            result = {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
-            if per_class_stats and label_groups:
-                label_metrics = {}
-                for label in label_groups.keys():
-                    cls_counts = per_class_stats[name][label]
-                    tp_c, fp_c, fn_c = cls_counts["tp"], cls_counts["fp"], cls_counts["fn"]
-                    if (tp_c + fp_c + fn_c) == 0:
-                        continue
-                    precision_c = tp_c / (tp_c + fp_c) if (tp_c + fp_c) > 0 else 0.0
-                    recall_c = tp_c / (tp_c + fn_c) if (tp_c + fn_c) > 0 else 0.0
-                    f1_c = (
-                        2 * precision_c * recall_c / (precision_c + recall_c)
-                        if (precision_c + recall_c) > 0
-                        else 0.0
-                    )
-                    label_metrics[label] = {
-                        "precision": precision_c,
-                        "recall": recall_c,
-                        "f1": f1_c,
-                        "tp": tp_c,
-                        "fp": fp_c,
-                        "fn": fn_c,
-                    }
-                if label_metrics:
-                    result["per_class"] = label_metrics
-            results[name] = result
-        return results
-
     def _set_mode(self, train: bool):
         for node in self.nodes:
             if train:
@@ -650,216 +552,10 @@ class BranchingCompositeTrainer:
         table.add_row([f"{metrics_dict[name]:.4f}" for name in columns])
         logger.info("\n%s:\n%s", title, table.get_string())
 
-    @staticmethod
-    def _log_f1_table(title: str, metrics_dict: dict[str, dict[str, float]], logger) -> None:
-        if not metrics_dict:
-            logger.info("%s: (no metrics)", title)
-            return
-        table = build_eval_table(metrics_dict)
-        logger.info("\n%s:\n%s", title, table)
-
-    def _log_leaf_ranking(
-        self,
-        title: str,
-        metrics_dict: dict[str, dict[str, float]],
-        logger,
-        top_k: int | None = None,
-        dev_metrics: dict[str, dict[str, float]] | None = None,
-        sorted_items: list[tuple[str, dict[str, float]]] | None = None,
-    ):
-        if not metrics_dict:
-            logger.info("%s ranking: (no metrics)", title)
-            return
-        items = sorted_items or self._sorted_leaves(metrics_dict)
-        if top_k is not None:
-            items = items[:top_k]
-        table = PrettyTable()
-        table.field_names = [
-            "rank",
-            "leaf",
-            "val_f1",
-            "val_precision",
-            "val_recall",
-            "dev_f1",
-            "dev_precision",
-            "dev_recall",
-        ]
-        for rank, (leaf, stats) in enumerate(items, start=1):
-            dev_stats = (dev_metrics or {}).get(leaf)
-            table.add_row(
-                [
-                    rank,
-                    leaf,
-                    f"{stats.get('f1', 0.0):.4f}",
-                    f"{stats.get('precision', 0.0):.4f}",
-                    f"{stats.get('recall', 0.0):.4f}",
-                    f"{(dev_stats or {}).get('f1', float('nan')):.4f}" if dev_stats else "",
-                    f"{(dev_stats or {}).get('precision', float('nan')):.4f}" if dev_stats else "",
-                    f"{(dev_stats or {}).get('recall', float('nan')):.4f}" if dev_stats else "",
-                ]
-            )
-        logger.info("\n%s ranking:\n%s", title, table.get_string())
-
-    @staticmethod
-    def _sorted_leaves(metrics_dict: dict[str, dict[str, float]]):
-        return sorted(metrics_dict.items(), key=lambda item: item[1].get("f1", 0.0), reverse=True)
-
-    @staticmethod
-    def _best_leaf(metrics_dict: dict[str, dict[str, float]]):
-        if not metrics_dict:
-            return None
-        return max(metrics_dict.items(), key=lambda item: item[1].get("f1", 0.0))
-
-    def _evaluate_leaf_on_loader(self, leaf_name, loader, logger, tag: str | None = None):
-        path = self.leaf_name_to_path.get(leaf_name)
-        if path is None:
-            logger.warning("Leaf %s not found; cannot run dev evaluation.", leaf_name)
-            return None
-        if len(path) != self.num_stages:
-            logger.warning("Leaf %s path length mismatch; expected %d got %d.", leaf_name, self.num_stages, len(path))
-            return None
-        node_paths = [tuple(path[:i]) for i in range(self.num_stages)]
-        nodes = []
-        for node_path in node_paths:
-            node = self.path_to_node.get(node_path)
-            if node is None:
-                logger.warning("Missing node for path %s; skipping dev eval for %s.", node_path, leaf_name)
-                return None
-            nodes.append(node)
-        branch_factors = path[:-1]
-        final_factor = path[-1]
-
-        stats = dict(tp=0, fp=0, fn=0)
-        label_names = loader.label_names if hasattr(loader, "label_names") else None
-        label_groups = _build_label_groups(label_names)
-        per_class = (
-            {label: dict(tp=0, fp=0, fn=0) for label in label_groups.keys()}
-            if label_groups
-            else None
-        )
-
-        self._set_mode(train=False)
-        iterator = tqdm(
-            loader,
-            desc=f"Leaf Eval {leaf_name}",
-            disable=should_disable_tqdm(metrics_only=True),
-        )
-        with torch.no_grad():
-            for batch in iterator:
-                embeddings = batch["embeddings"].to(self.device, non_blocking=True)
-                attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
-                incoming = batch.get("incoming")
-                outgoing = batch.get("outgoing")
-                ner_tags = batch.get("ner_tags")
-                if incoming is not None:
-                    incoming = incoming.to(self.device, non_blocking=True)
-                if outgoing is not None:
-                    outgoing = outgoing.to(self.device, non_blocking=True)
-                if ner_tags is None:
-                    continue
-                ner_tags = ner_tags.to(self.device, non_blocking=True)
-
-                cur_embeddings = embeddings
-                cur_mask = attention_mask
-                cur_incoming = incoming
-                cur_outgoing = outgoing
-
-                for stage_idx, node in enumerate(nodes):
-                    _, _, selector_out = self._selector_forward(node.selector, cur_embeddings, cur_mask, cur_incoming, cur_outgoing)
-                    selection_mask = self._build_selection_mask(selector_out["gates"], cur_mask)
-                    cur_embeddings = cur_embeddings * selection_mask.unsqueeze(-1)
-                    cur_mask = (cur_mask * selection_mask.long()).clamp(max=1)
-                    cur_incoming = cur_incoming * selection_mask if cur_incoming is not None else None
-                    cur_outgoing = cur_outgoing * selection_mask if cur_outgoing is not None else None
-
-                    _, _, expert_out = self._expert_forward(
-                        node.expert, cur_embeddings, cur_mask, cur_incoming, cur_outgoing
-                    )
-
-                    if stage_idx < len(nodes) - 1:
-                        target_factor = branch_factors[stage_idx]
-                        predictions = expert_out["pi"].argmax(dim=-1)
-                        child_bool = (cur_mask > 0) & (predictions == target_factor)
-                        if not child_bool.any():
-                            cur_mask = cur_mask.new_zeros(cur_mask.shape)
-                            break
-                        cur_embeddings = cur_embeddings * child_bool.unsqueeze(-1).to(cur_embeddings.dtype)
-                        cur_mask = child_bool.long()
-                        cur_incoming = (
-                            cur_incoming * child_bool if cur_incoming is not None else None
-                        )
-                        cur_outgoing = (
-                            cur_outgoing * child_bool if cur_outgoing is not None else None
-                        )
-                    else:
-                        valid = cur_mask > 0
-                        if not valid.any():
-                            break
-                        predictions = expert_out["pi"].argmax(dim=-1)
-                        pred_idx = valid & (predictions == final_factor)
-                        gold = (ner_tags > 0) & valid
-                        stats["tp"] += (pred_idx & gold).sum().item()
-                        stats["fp"] += (pred_idx & (~gold)).sum().item()
-                        stats["fn"] += ((~pred_idx) & gold).sum().item()
-                        if per_class is not None:
-                            for label, indices in label_groups.items():
-                                class_mask = torch.zeros_like(valid, dtype=torch.bool)
-                                for label_id in indices:
-                                    class_mask |= ner_tags == label_id
-                                class_mask = class_mask & valid
-                                tp_c = (pred_idx & class_mask).sum().item()
-                                fp_c = (pred_idx & (~class_mask)).sum().item()
-                                fn_c = ((~pred_idx) & class_mask).sum().item()
-                                counts = per_class[label]
-                                counts["tp"] += tp_c
-                                counts["fp"] += fp_c
-                                counts["fn"] += fn_c
-                        break
-
-        tp, fp, fn = stats["tp"], stats["fp"], stats["fn"]
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-        metrics = {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
-        if per_class is not None:
-            per_class_metrics = {}
-            for label, counts in per_class.items():
-                tp_c, fp_c, fn_c = counts["tp"], counts["fp"], counts["fn"]
-                if tp_c + fp_c + fn_c == 0:
-                    continue
-                precision_c = tp_c / (tp_c + fp_c) if (tp_c + fp_c) > 0 else 0.0
-                recall_c = tp_c / (tp_c + fn_c) if (tp_c + fn_c) > 0 else 0.0
-                f1_c = (
-                    2 * precision_c * recall_c / (precision_c + recall_c)
-                    if (precision_c + recall_c) > 0
-                    else 0.0
-                )
-                per_class_metrics[label] = {
-                    "precision": precision_c,
-                    "recall": recall_c,
-                    "f1": f1_c,
-                    "tp": tp_c,
-                    "fp": fp_c,
-                    "fn": fn_c,
-                }
-            if per_class_metrics:
-                metrics["per_class"] = per_class_metrics
-
-        suffix = f" ({tag})" if tag else ""
-        logger.debug(
-            "Leaf %s%s dev evaluation: precision %.4f recall %.4f f1 %.4f",
-            leaf_name,
-            suffix,
-            precision,
-            recall,
-            f1,
-        )
-        return metrics
-
 
 @hydra_main(config_path="conf", config_name="composite", version_base="1.1")
 def main(cfg):
-    logger = get_logger("train_branching_composite.log")
+    logger = get_logger("train_composite_branching.log")
     xp = get_xp()
     logger.info(f"Exp signature: {xp.sig}")
     logger.info(repr(cfg))
@@ -881,27 +577,27 @@ def main(cfg):
         trainer._log_metrics_table("Selector Eval", results["selector_avg"], logger)
         trainer._log_metrics_table("Expert Eval", results["expert_avg"], logger)
         leaf_metrics = results["leaf_metrics"]
-        sorted_leaves = trainer._sorted_leaves(leaf_metrics)
-        trainer._log_f1_table("Leaf Factors Eval", leaf_metrics, logger)
+        ranked_leaves = sorted_leaves(leaf_metrics)
+        log_f1_table("Leaf Factors Eval", leaf_metrics, logger)
         if dev_dl is not None:
             epoch_dev = {}
-            for leaf, _ in sorted_leaves[: trainer.dev_eval_top_k]:
-                dev_metrics = trainer._evaluate_leaf_on_loader(leaf, dev_dl, logger, tag="eval_only")
+            for leaf, _ in ranked_leaves[: trainer.dev_eval_top_k]:
+                dev_metrics = evaluate_leaf_on_loader(trainer, leaf, dev_dl, logger, tag="eval_only")
                 if dev_metrics:
                     trainer.leaf_dev_metrics[leaf] = dev_metrics
                     epoch_dev[leaf] = dev_metrics
             if epoch_dev:
-                best_dev_leaf = trainer._best_leaf(epoch_dev)
+                best_dev_leaf = best_leaf(epoch_dev)
                 if best_dev_leaf:
                     dev_leaf_name, dev_leaf_stats = best_dev_leaf
                     xp.link.push_metrics({"branch/dev_leaf_eval_only": {dev_leaf_name: dev_leaf_stats}})
-        trainer._log_leaf_ranking(
+        log_leaf_ranking(
             "Leaf Factors Eval",
             leaf_metrics,
             logger,
             top_k=trainer.dev_eval_top_k,
             dev_metrics=trainer.leaf_dev_metrics,
-            sorted_items=sorted_leaves,
+            sorted_items=ranked_leaves,
         )
     else:
         trainer.train(train_dl, eval_dl, dev_dl, logger, xp)
