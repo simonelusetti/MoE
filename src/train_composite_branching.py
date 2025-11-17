@@ -195,8 +195,6 @@ class BranchingCompositeTrainer:
             selector_loss, expert_loss = self._forward_batch(
                 tensors.embeddings,
                 tensors.attention_mask,
-                tensors.incoming,
-                tensors.outgoing,
                 selector_sums,
                 selector_counts,
                 expert_sums,
@@ -239,8 +237,6 @@ class BranchingCompositeTrainer:
                 self._forward_batch(
                     tensors.embeddings,
                     tensors.attention_mask,
-                    tensors.incoming,
-                    tensors.outgoing,
                     selector_sums,
                     selector_counts,
                     expert_sums,
@@ -272,8 +268,6 @@ class BranchingCompositeTrainer:
         self,
         embeddings,
         mask,
-        incoming,
-        outgoing,
         selector_sums,
         selector_counts,
         expert_sums,
@@ -289,8 +283,6 @@ class BranchingCompositeTrainer:
             self.root,
             embeddings,
             mask,
-            incoming,
-            outgoing,
             selector_sums,
             selector_counts,
             expert_sums,
@@ -308,8 +300,6 @@ class BranchingCompositeTrainer:
         node: BranchNode,
         embeddings,
         mask,
-        incoming,
-        outgoing,
         selector_sums,
         selector_counts,
         expert_sums,
@@ -325,18 +315,16 @@ class BranchingCompositeTrainer:
             return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
 
         selector_loss, selector_metrics, selector_out = self._selector_forward(
-            node.selector, embeddings, mask, incoming, outgoing
+            node.selector, embeddings, mask
         )
         update_epoch_metrics(selector_sums, selector_counts, selector_metrics)
 
         selection_mask = self._build_selection_mask(selector_out["gates"], mask)
         selected_embeddings = embeddings * selection_mask.unsqueeze(-1)
         selected_mask = (mask * selection_mask.long()).clamp(max=1)
-        selected_incoming = incoming * selection_mask if incoming is not None else None
-        selected_outgoing = outgoing * selection_mask if outgoing is not None else None
 
         expert_loss, expert_metrics, expert_out = self._expert_forward(
-            node.expert, selected_embeddings, selected_mask, selected_incoming, selected_outgoing
+            node.expert, selected_embeddings, selected_mask
         )
         update_epoch_metrics(expert_sums, expert_counts, expert_metrics)
 
@@ -352,18 +340,10 @@ class BranchingCompositeTrainer:
                     continue
                 child_mask = child_bool.long()
                 child_embeddings = selected_embeddings * child_bool.unsqueeze(-1).to(selected_embeddings.dtype)
-                child_incoming = (
-                    selected_incoming * child_bool if selected_incoming is not None else None
-                )
-                child_outgoing = (
-                    selected_outgoing * child_bool if selected_outgoing is not None else None
-                )
                 c_sel, c_exp = self._forward_node(
                     child,
                     child_embeddings,
                     child_mask,
-                    child_incoming,
-                    child_outgoing,
                     selector_sums,
                     selector_counts,
                     expert_sums,
@@ -392,8 +372,8 @@ class BranchingCompositeTrainer:
 
         return selector_total, expert_total
 
-    def _selector_forward(self, selector, tokens, mask, incoming, outgoing):
-        outputs = selector(tokens, mask, incoming, outgoing)
+    def _selector_forward(self, selector, tokens, mask):
+        outputs = selector(tokens, mask)
         h_anchor = outputs["h_anchor"]
         h_rat = outputs["h_rat"]
         h_comp = outputs["h_comp"]
@@ -425,8 +405,8 @@ class BranchingCompositeTrainer:
         }
         return total_loss, metrics, outputs
 
-    def _expert_forward(self, expert, embeddings, mask, incoming, outgoing):
-        outputs = expert(embeddings, mask, incoming, outgoing)
+    def _expert_forward(self, expert, embeddings, mask):
+        outputs = expert(embeddings, mask)
         anchor = outputs["anchor"]
         reconstruction = outputs["reconstruction"]
 

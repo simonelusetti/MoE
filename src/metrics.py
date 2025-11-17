@@ -123,14 +123,7 @@ def evaluate_factor_metrics(model, loader, device, logger=None, threshold: float
             embeddings = batch["embeddings"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             ner_tags = batch["ner_tags"].to(device, non_blocking=True)
-            incoming = batch.get("incoming")
-            outgoing = batch.get("outgoing")
-            if incoming is not None:
-                incoming = incoming.to(device, non_blocking=True)
-            if outgoing is not None:
-                outgoing = outgoing.to(device, non_blocking=True)
-
-            outputs = model(embeddings, attention_mask, incoming, outgoing)
+            outputs = model(embeddings, attention_mask)
             routing_scores = outputs["pi"]
             max_scores, routing = routing_scores.max(dim=-1)
 

@@ -124,15 +124,12 @@ def _encode_examples(ds, tok, encoder, text_fn, max_length, keep_labels=None):
             "attention_mask": torch.tensor(enc["attention_mask"], device=device).unsqueeze(0),
         }
         with torch.no_grad():
-            out = encoder(**inputs, output_attentions=True, return_dict=True)
-            attns = out.attentions[-1].mean(1)   # last layer, avg heads [B,L,L]
+            out = encoder(**inputs, output_attentions=False, return_dict=True)
 
             out_dict = {
                 "input_ids": np.asarray(enc["input_ids"], dtype=np.int64),
                 "attention_mask": np.asarray(enc["attention_mask"], dtype=np.int64),
                 "embeddings": out.last_hidden_state.squeeze(0).detach().cpu().to(torch.float32).numpy(),
-                "incoming": attns.sum(-2).squeeze(0).detach().cpu().to(torch.float32).numpy(),   # [L]
-                "outgoing": attns.sum(-1).squeeze(0).detach().cpu().to(torch.float32).numpy(),   # [L]
             }
             # Align ner_tags to subword tokens if present
             if has_ner:
@@ -803,8 +800,6 @@ def collate(batch):
 
     input_ids = [_as_tensor(x["input_ids"], torch.long) for x in batch]
     attention_masks = [_as_tensor(x["attention_mask"], torch.long) for x in batch]
-    incoming = [_as_tensor(x["incoming"], torch.float) for x in batch]
-    outgoing = [_as_tensor(x["outgoing"], torch.float) for x in batch]
 
     has_ner = "ner_tags" in batch[0]
     if has_ner:
@@ -813,16 +808,12 @@ def collate(batch):
     # pad to longest sequence in batch
     input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
     attention_masks = pad_sequence(attention_masks, batch_first=True, padding_value=0)
-    incoming = pad_sequence(incoming, batch_first=True, padding_value=0.0)
-    outgoing = pad_sequence(outgoing, batch_first=True, padding_value=0.0)
     if has_ner:
         ner_tags = pad_sequence(ner_tags, batch_first=True, padding_value=-100)  # -100 is common ignore_index
 
     batch_out = {
         "input_ids": input_ids,
         "attention_mask": attention_masks,
-        "incoming": incoming,
-        "outgoing": outgoing
     }
 
     if has_ner:

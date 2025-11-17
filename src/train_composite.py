@@ -98,18 +98,9 @@ class CompositeTrainer:
                 selected_embeddings = embeddings * selection_mask.unsqueeze(-1)
                 selected_attention_mask = (attention_mask * selection_mask.long()).clamp(max=1)
 
-                incoming = batch.get("incoming")
-                outgoing = batch.get("outgoing")
-                if incoming is not None:
-                    incoming = incoming.to(self.device, non_blocking=True)
-                if outgoing is not None:
-                    outgoing = outgoing.to(self.device, non_blocking=True)
-
                 expert_loss, expert_metrics, _ = self._expert_forward(
                     selected_embeddings,
                     selected_attention_mask,
-                    incoming,
-                    outgoing,
                 )
 
                 total_loss = self.selector_weight * selector_loss + self.expert_weight * expert_loss
@@ -208,18 +199,9 @@ class CompositeTrainer:
                 selected_embeddings = embeddings * selection_mask.unsqueeze(-1)
                 selected_attention_mask = (attention_mask * selection_mask.long()).clamp(max=1)
 
-                incoming = batch.get("incoming")
-                outgoing = batch.get("outgoing")
-                if incoming is not None:
-                    incoming = incoming.to(self.device, non_blocking=True)
-                if outgoing is not None:
-                    outgoing = outgoing.to(self.device, non_blocking=True)
-
                 expert_loss, expert_metrics, expert_out = self._expert_forward(
                     selected_embeddings,
                     selected_attention_mask,
-                    incoming,
-                    outgoing,
                 )
 
                 selector_metrics_with_loss = dict(selector_metrics)
@@ -285,14 +267,7 @@ class CompositeTrainer:
         tokens = batch["embeddings"].to(self.device, non_blocking=True)
         mask = batch["attention_mask"].to(self.device, non_blocking=True)
 
-        incoming = batch.get("incoming")
-        outgoing = batch.get("outgoing")
-        if incoming is not None:
-            incoming = incoming.to(self.device, non_blocking=True)
-        if outgoing is not None:
-            outgoing = outgoing.to(self.device, non_blocking=True)
-
-        outputs = self.selector(tokens, mask, incoming, outgoing)
+        outputs = self.selector(tokens, mask)
         h_anchor = outputs["h_anchor"]
         h_rat = outputs["h_rat"]
         h_comp = outputs["h_comp"]
@@ -327,8 +302,8 @@ class CompositeTrainer:
             return total_loss, metrics, outputs, tokens, mask
         return total_loss, metrics
 
-    def _expert_forward(self, embeddings, attention_mask, incoming, outgoing):
-        outputs = self.expert(embeddings, attention_mask, incoming, outgoing)
+    def _expert_forward(self, embeddings, attention_mask):
+        outputs = self.expert(embeddings, attention_mask)
         anchor = outputs["anchor"]
         reconstruction = outputs["reconstruction"]
 

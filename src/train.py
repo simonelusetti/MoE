@@ -41,14 +41,7 @@ class ExpertTrainer:
     def _loss(self, model, batch, device):
         embeddings = batch["embeddings"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        incoming = batch.get("incoming")
-        outgoing = batch.get("outgoing")
-        if incoming is not None:
-            incoming = incoming.to(device, non_blocking=True)
-        if outgoing is not None:
-            outgoing = outgoing.to(device, non_blocking=True)
-
-        outputs = model(embeddings, attention_mask, incoming, outgoing)
+        outputs = model(embeddings, attention_mask)
         anchor = outputs["anchor"]
         reconstruction = outputs["reconstruction"]
 

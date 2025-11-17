@@ -26,8 +26,6 @@ class BranchNode:
 class BatchTensors:
     embeddings: torch.Tensor
     attention_mask: torch.Tensor
-    incoming: torch.Tensor | None
-    outgoing: torch.Tensor | None
     ner_tags: torch.Tensor | None = None
 
 
@@ -101,21 +99,14 @@ def build_branch_tree(
 
 
 def prepare_batch(batch, device, *, require_labels: bool = False) -> BatchTensors:
-    def _move_optional(tensor):
-        if tensor is None:
-            return None
-        return tensor.to(device, non_blocking=True)
-
     embeddings = batch["embeddings"].to(device, non_blocking=True)
     attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-    incoming = _move_optional(batch.get("incoming"))
-    outgoing = _move_optional(batch.get("outgoing"))
     ner_tags = batch.get("ner_tags")
     if ner_tags is None and require_labels:
-        return BatchTensors(embeddings, attention_mask, incoming, outgoing, None)
+        return BatchTensors(embeddings, attention_mask, None)
     if ner_tags is not None:
         ner_tags = ner_tags.to(device, non_blocking=True)
-    return BatchTensors(embeddings, attention_mask, incoming, outgoing, ner_tags)
+    return BatchTensors(embeddings, attention_mask, ner_tags)
 
 
 def update_epoch_metrics(sums, counts, metrics):
@@ -322,21 +313,17 @@ def evaluate_leaf_on_loader(trainer, leaf_name, loader, logger, tag: str | None 
 
             cur_embeddings = tensors.embeddings
             cur_mask = tensors.attention_mask
-            cur_incoming = tensors.incoming
-            cur_outgoing = tensors.outgoing
 
             for stage_idx, node in enumerate(nodes):
                 _, _, selector_out = trainer._selector_forward(
-                    node.selector, cur_embeddings, cur_mask, cur_incoming, cur_outgoing
+                    node.selector, cur_embeddings, cur_mask
                 )
                 selection_mask = trainer._build_selection_mask(selector_out["gates"], cur_mask)
                 cur_embeddings = cur_embeddings * selection_mask.unsqueeze(-1)
                 cur_mask = (cur_mask * selection_mask.long()).clamp(max=1)
-                cur_incoming = cur_incoming * selection_mask if cur_incoming is not None else None
-                cur_outgoing = cur_outgoing * selection_mask if cur_outgoing is not None else None
 
                 _, _, expert_out = trainer._expert_forward(
-                    node.expert, cur_embeddings, cur_mask, cur_incoming, cur_outgoing
+                    node.expert, cur_embeddings, cur_mask
                 )
 
                 if stage_idx < len(nodes) - 1:
@@ -346,12 +333,8 @@ def evaluate_leaf_on_loader(trainer, leaf_name, loader, logger, tag: str | None 
                     if not child_bool.any():
                         cur_mask = cur_mask.new_zeros(cur_mask.shape)
                         break
-                    cur_embeddings = cur_embeddings * child_bool.unsqueeze(-1).to(cur_embeddings.dtype)
-                    cur_mask = child_bool.long()
-                    if cur_incoming is not None:
-                        cur_incoming = cur_incoming * child_bool
-                    if cur_outgoing is not None:
-                        cur_outgoing = cur_outgoing * child_bool
+                        cur_embeddings = cur_embeddings * child_bool.unsqueeze(-1).to(cur_embeddings.dtype)
+                        cur_mask = child_bool.long()
                 else:
                     valid = cur_mask > 0
                     if not valid.any():

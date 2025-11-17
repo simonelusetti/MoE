@@ -173,7 +173,7 @@ class ExpertModel(nn.Module):
         off_diag = gram - torch.diag_embed(diag)
         return off_diag.pow(2).sum()
 
-    def forward(self, embeddings, attention_mask, incoming=None, outgoing=None):
+    def forward(self, embeddings, attention_mask):
         mask_float = attention_mask.to(dtype=embeddings.dtype)
         gate_logits = self.gate(embeddings)
         routing_weights = self._apply_routing(gate_logits, mask_float)
