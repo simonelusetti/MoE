@@ -22,7 +22,7 @@ from ratcon.models import RationaleSelectorModel, nt_xent
 from .data import initialize_dataloaders
 from .metrics import build_eval_table, _build_label_groups
 from .models import ExpertModel
-from .utils import get_logger, should_disable_tqdm
+from .utils import configure_runtime, get_logger, should_disable_tqdm
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -60,7 +60,7 @@ class CompositeTrainer:
         self.grad_clip = float(cfg.train.grad_clip)
         self.selector_weight = float(cfg.composite.loss_weights.selector)
         self.expert_weight = float(cfg.composite.loss_weights.expert)
-        self.contrastive_tau = float(getattr(cfg.model, "contrastive_tau", 0.07))
+        self.contrastive_tau = float(cfg.model.contrastive_tau)
 
         loss_cfg = self.selector_cfg.loss
         self.selector_tau = float(loss_cfg.tau)
@@ -177,7 +177,8 @@ class CompositeTrainer:
 
         selector_stats = dict(tp=0, fp=0, fn=0)
         expert_stats = [dict(tp=0, fp=0, fn=0) for _ in range(self.expert.num_experts)]
-        label_groups = _build_label_groups(getattr(loader, "label_names", None))
+        label_names = loader.label_names if hasattr(loader, "label_names") else None
+        label_groups = _build_label_groups(label_names)
         expert_class_stats = (
             [
                 {label: dict(tp=0, fp=0, fn=0) for label in label_groups.keys()}
@@ -556,12 +557,14 @@ def main(cfg):
     logger.info("Config: %s", cfg)
     logger.info("Working directory: %s", os.getcwd())
 
+    configure_runtime(cfg)
+
     if cfg.device == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA requested but not available. Falling back to CPU.")
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     cfg.device = device.type
 
-    train_dl, eval_dl = initialize_dataloaders(cfg, logger)
+    train_dl, eval_dl, _ = initialize_dataloaders(cfg, logger)
 
     trainer = CompositeTrainer(cfg, device)
     trainer.train(train_dl, eval_dl, logger, xp)

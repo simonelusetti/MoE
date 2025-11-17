@@ -22,12 +22,13 @@ selector_model:
 
 composite:
   selector_threshold: 0.5
+  num_stages: 3
   loss_weights:
     selector: 1.0
     expert: 1.0
 
 train:
-  epochs: 15
+  epochs: 30
   grad_clip: 1.0
 
 data:

@@ -704,55 +704,89 @@ def build_dataset(
     return ds, tok
 
 def initialize_dataloaders(cfg, logger):
+    train_cfg = cfg.data.train
+    eval_cfg = cfg.data.eval
+    dev_cfg = cfg.data.dev
+
+    train_cnn_field = train_cfg.cnn_field if hasattr(train_cfg, "cnn_field") else None
     train_ds, _ = get_dataset(
-        name=cfg.data.train.dataset,
-        subset=cfg.data.train.subset,
+        name=train_cfg.dataset,
+        subset=train_cfg.subset,
         rebuild=cfg.data.rebuild_ds,
-        shuffle=cfg.data.train.shuffle,
-        dataset_config=getattr(cfg.data.train, "config", None),
-        cnn_field=getattr(cfg.data.train, "cnn_field", None),
+        shuffle=train_cfg.shuffle,
+        dataset_config=train_cfg.config,
+        cnn_field=train_cnn_field,
     )
-    eval_shuffle = bool(cfg.data.eval.shuffle)
+    eval_shuffle = bool(eval_cfg.shuffle)
     if eval_shuffle:
         logger.warning("Disabling shuffle for expert evaluation loader to preserve ordering.")
         eval_shuffle = False
 
+    eval_split = eval_cfg.split if hasattr(eval_cfg, "split") else "validation"
+    eval_cnn_field = eval_cfg.cnn_field if hasattr(eval_cfg, "cnn_field") else None
     eval_ds, _ = get_dataset(
-        split="validation",
-        name=cfg.data.eval.dataset,
-        subset=cfg.data.eval.subset,
+        split=eval_split,
+        name=eval_cfg.dataset,
+        subset=eval_cfg.subset,
         rebuild=cfg.data.rebuild_ds,
         shuffle=eval_shuffle,
-        dataset_config=getattr(cfg.data.eval, "config", None),
-        cnn_field=getattr(cfg.data.eval, "cnn_field", None),
+        dataset_config=eval_cfg.config,
+        cnn_field=eval_cnn_field,
     )
+
+    dev_dl = None
+    if dev_cfg and dev_cfg.dataset:
+        dev_cnn_field = dev_cfg.cnn_field if hasattr(dev_cfg, "cnn_field") else None
+        dev_split = dev_cfg.split if hasattr(dev_cfg, "split") else "test"
+        dev_ds, _ = get_dataset(
+            split=dev_split,
+            name=dev_cfg.dataset,
+            subset=dev_cfg.subset,
+            rebuild=cfg.data.rebuild_ds,
+            shuffle=bool(dev_cfg.shuffle),
+            dataset_config=dev_cfg.config,
+            cnn_field=dev_cnn_field,
+        )
+        dev_dl = DataLoader(
+            dev_ds,
+            batch_size=dev_cfg.batch_size,
+            collate_fn=collate,
+            num_workers=dev_cfg.num_workers,
+            pin_memory=(cfg.device == "cuda"),
+            persistent_workers=(dev_cfg.num_workers > 0),
+            shuffle=bool(dev_cfg.shuffle),
+        )
 
     train_dl = DataLoader(
         train_ds,
-        batch_size=cfg.data.train.batch_size,
+        batch_size=train_cfg.batch_size,
         collate_fn=collate,
-        num_workers=cfg.data.train.num_workers,
+        num_workers=train_cfg.num_workers,
         pin_memory=(cfg.device == "cuda"),
-        persistent_workers=(cfg.data.train.num_workers > 0),
-        shuffle=cfg.data.train.shuffle,
+        persistent_workers=(train_cfg.num_workers > 0),
+        shuffle=train_cfg.shuffle,
     )
     eval_dl = DataLoader(
         eval_ds,
-        batch_size=cfg.data.eval.batch_size,
+        batch_size=eval_cfg.batch_size,
         collate_fn=collate,
-        num_workers=cfg.data.eval.num_workers,
+        num_workers=eval_cfg.num_workers,
         pin_memory=(cfg.device == "cuda"),
-        persistent_workers=(cfg.data.eval.num_workers > 0),
+        persistent_workers=(eval_cfg.num_workers > 0),
         shuffle=eval_shuffle,
     )
 
     train_label_names = NER_LABEL_NAMES.get(cfg.data.train.dataset)
     if train_label_names:
         setattr(train_dl, "label_names", train_label_names)
-    eval_label_names = NER_LABEL_NAMES.get(cfg.data.eval.dataset)
+    eval_label_names = NER_LABEL_NAMES.get(eval_cfg.dataset)
     if eval_label_names:
         setattr(eval_dl, "label_names", eval_label_names)
-    return train_dl, eval_dl
+    if dev_dl is not None:
+        dev_label_names = NER_LABEL_NAMES.get(dev_cfg.dataset)
+        if dev_label_names:
+            setattr(dev_dl, "label_names", dev_label_names)
+    return train_dl, eval_dl, dev_dl
 
 # ---------- Collate ----------
 

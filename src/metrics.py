@@ -14,9 +14,11 @@ def filter_metric(name, value, *, model=None, weights=None):
     if not math.isfinite(value):
         return False
     if model is not None:
-        if name == "balance" and getattr(model, "use_balance", True) is False:
+        use_balance = model.use_balance if hasattr(model, "use_balance") else True
+        if name == "balance" and use_balance is False:
             return False
-        if name == "diversity" and getattr(model, "use_diversity", True) is False:
+        use_diversity = model.use_diversity if hasattr(model, "use_diversity") else True
+        if name == "diversity" and use_diversity is False:
             return False
         if name == "continuity":
             if not hasattr(model, "use_continuity"):
@@ -103,7 +105,8 @@ def evaluate_factor_metrics(model, loader, device, logger=None, threshold: float
     stats = [dict(tp=0, fp=0, fn=0) for _ in range(num_factors)]
     has_labels = False
 
-    label_groups = _build_label_groups(getattr(loader, "label_names", None))
+    label_names = loader.label_names if hasattr(loader, "label_names") else None
+    label_groups = _build_label_groups(label_names)
     per_class_stats = None
     if label_groups:
         per_class_stats = [

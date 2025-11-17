@@ -28,7 +28,7 @@ class ExpertModel(nn.Module):
         self.use_balance = expert_cfg.use_balance
         self.use_diversity = expert_cfg.use_diversity
         self.use_continuity = bool(expert_cfg.use_continuity)
-        self.use_attention = bool(getattr(expert_cfg, "use_attention", False))
+        self.use_attention = bool(expert_cfg.use_attention)
 
         self.sbert = SentenceTransformer(cfg.sbert_name)
         self.pooler = self.sbert[1]
@@ -38,8 +38,8 @@ class ExpertModel(nn.Module):
         factor_hidden = int(expert_cfg.factor_hidden)
         self.factor_dim = factor_dim
         if self.use_attention:
-            attn_heads = int(getattr(expert_cfg, "attention_heads", 1))
-            attn_dropout = float(getattr(expert_cfg, "attention_dropout", 0.0))
+            attn_heads = int(expert_cfg.attention_heads)
+            attn_dropout = float(expert_cfg.attention_dropout)
             if factor_dim % attn_heads != 0:
                 raise ValueError(
                     "expert.factor_dim must be divisible by attention_heads when attention is enabled."

@@ -10,7 +10,7 @@ from dora import get_xp, hydra_main
 
 from .data import initialize_dataloaders
 from .models import ExpertModel
-from .utils import get_logger, should_disable_tqdm
+from .utils import configure_runtime, get_logger, should_disable_tqdm
 from .metrics import build_train_table, build_eval_table, evaluate_factor_metrics
 
 
@@ -20,7 +20,7 @@ class ExpertTrainer:
     def __init__(self, cfg):
         self.cfg = cfg
         self.weights = self._prepare_expert_weights(cfg)
-        self.contrastive_tau = getattr(cfg.model, "contrastive_tau", 0.07)
+        self.contrastive_tau = cfg.model.contrastive_tau
 
     @staticmethod
     def _prepare_expert_weights(cfg):
@@ -32,7 +32,7 @@ class ExpertTrainer:
             "overlap": float(weights_cfg.overlap),
             "diversity": float(weights_cfg.diversity),
             "balance": float(weights_cfg.balance),
-            "attention": float(getattr(weights_cfg, "attention", 0.0)),
+            "attention": float(weights_cfg.attention),
         }
         if cfg.model.expert.use_continuity:
             weights["continuity"] = float(weights_cfg.continuity)
@@ -154,7 +154,7 @@ class ExpertTrainer:
     def train(self, cfg, logger, train_dl, eval_dl, xp):
         device = cfg.device
         model = ExpertModel(cfg.model).to(device)
-        factor_threshold = getattr(cfg.eval, "factor_threshold", None)
+        factor_threshold = cfg.eval.factor_threshold
         if factor_threshold is not None:
             factor_threshold = float(factor_threshold)
 
@@ -238,7 +238,7 @@ class ExpertTrainer:
     def evaluate(self, cfg, logger, eval_dl, xp):
         device = cfg.device
         model = ExpertModel(cfg.model).to(device)
-        factor_threshold = getattr(cfg.eval, "factor_threshold", None)
+        factor_threshold = cfg.eval.factor_threshold
         if factor_threshold is not None:
             factor_threshold = float(factor_threshold)
         checkpoint_path = "expert_model.pth"
@@ -275,13 +275,15 @@ def main(cfg):
     logger.info(f"Work dir: {os.getcwd()}")
     logger.info(f"Exec file: {__file__}")
 
+    configure_runtime(cfg)
+
     if cfg.device == "cuda" and not torch.cuda.is_available():
         logger.warning("No GPU available, switching to CPU")
     cfg.device = cfg.device if torch.cuda.is_available() else "cpu"
 
     trainer = ExpertTrainer(cfg)
 
-    train_dl, eval_dl = initialize_dataloaders(cfg, logger)
+    train_dl, eval_dl, _ = initialize_dataloaders(cfg, logger)
 
     if cfg.eval.eval_only:
         trainer.evaluate(cfg, logger, eval_dl, xp)

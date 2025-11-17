@@ -6,6 +6,29 @@ from pathlib import Path
 from tqdm import tqdm
 
 
+def configure_runtime(cfg):
+    runtime = cfg.runtime
+    num_threads = runtime.num_threads
+    if not num_threads:
+        return
+    try:
+        num_threads = int(num_threads)
+    except (TypeError, ValueError):
+        return
+    if num_threads <= 0:
+        return
+    value = str(num_threads)
+    for env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[env_var] = value
+    try:
+        import torch
+
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(max(1, num_threads // 2))
+    except Exception:
+        pass
+
+
 def should_disable_tqdm(*, metrics_only=False):
     """Return True when tqdm progress bars should be disabled."""
     if metrics_only:
