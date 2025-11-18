@@ -4,10 +4,10 @@ This directory hosts helper scripts for both local experimentation (no Slurm) an
 
 ## Local runners (no Slurm required)
 
-- `pseudo_grid.py` / `pseudo_grid_composite.py`: sequential “grid” launchers that iterate over the standard dataset overrides. Use them to sanity-check the expert or composite trainers on workstations:
+- `tools/runners/pseudo_grid.py` and `pseudo_grid_composite.py`: sequential “grid” launchers that iterate over the standard dataset overrides. Use them to sanity-check the expert or composite trainers on workstations:
   ```bash
-  python tools/pseudo_grid.py --only wikiann conll2003 --extra train.epochs=3
-  python tools/pseudo_grid_composite.py --dry-run
+  python tools/runners/pseudo_grid.py --only wikiann conll2003 --extra train.epochs=3
+  python tools/runners/pseudo_grid_composite.py --dry-run
   ```
 - These scripts accept arbitrary Hydra overrides via `--extra`, so they mirror the Slurm launcher arguments without needing `sbatch`.
 
