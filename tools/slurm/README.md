@@ -12,4 +12,4 @@ This folder groups all batch scripts by task type:
 - Logs are written under `logs/{datasets|training|analysis}/` in the repository root.
 - Scripts source `common.sh`, so update that file if the virtualenv or cache paths change.
 - Additional Hydra overrides can be passed to training scripts after `--` when submitting via `sbatch`.
-- Dataset scripts call `tools/build_dataset.py`; ensure datasets/caches exist before launching training jobs.
+- Dataset scripts call `tools/datasets/build_dataset.py`; ensure datasets/caches exist before launching training jobs.

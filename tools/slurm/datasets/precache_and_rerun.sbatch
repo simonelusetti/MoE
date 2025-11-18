@@ -14,4 +14,4 @@ source "$REPO_ROOT/tools/slurm/common.sh"
 
 mkdir -p "$REPO_ROOT/logs/datasets"
 
-python -m tools.prechache --rerun-grid
+python -m tools.precache --rerun-grid

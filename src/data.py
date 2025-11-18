@@ -268,81 +268,6 @@ def _parse_framenet_conll_file(path: str):
     return examples
 
 
-def _normalize_wnut_split(split: str) -> str:
-    split = split.lower().strip()
-    split = split.rstrip(".")
-    mapping = {
-        "train": "train",
-        "validation": "validation",
-        "val": "validation",
-        "dev": "validation",
-        "test": "test",
-    }
-    if split not in mapping:
-        raise ValueError(f"Unsupported WNUT split '{split}'.")
-    return mapping[split]
-
-
-def _download_wnut_file(split: str) -> Path:
-    normalized = _normalize_wnut_split(split)
-    url = WNUT_URLS.get(normalized)
-    if url is None:
-        raise ValueError(f"Split '{split}' not available for WNUT dataset.")
-    data_dir = _raw_data_dir()
-    filename = os.path.basename(urlparse(url).path)
-    target = data_dir / filename
-    if target.exists():
-        return target
-    if _is_offline():
-        raise RuntimeError(
-            f"Cannot download WNUT split '{split}' while offline. Pre-download {url} to {target}."
-        )
-    try:
-        with urlopen(url) as src, open(target, "wb") as dst:
-            dst.write(src.read())
-    except URLError as err:
-        raise RuntimeError(
-            f"Failed to download WNUT data from {url}: {err}. "
-            f"Download the file manually and place it at {target}."
-        ) from err
-    return target
-
-
-def _parse_wnut_file(path: Path):
-    sentences = []
-    tokens = []
-    labels = []
-    label_map = WNUT_LABEL_TO_ID
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            stripped = line.strip()
-            if not stripped:
-                if tokens:
-                    sentences.append({"tokens": tokens, "ner_tags": labels})
-                    tokens = []
-                    labels = []
-                continue
-            parts = stripped.split("\t")
-            if len(parts) != 2:
-                continue
-            token, label = parts
-            tokens.append(token)
-            if label not in label_map:
-                raise ValueError(f"Unknown WNUT label '{label}' in {path}")
-            labels.append(label_map[label])
-    if tokens:
-        sentences.append({"tokens": tokens, "ner_tags": labels})
-    for idx, item in enumerate(sentences):
-        item["id"] = str(idx)
-    return sentences
-
-
-def _load_wnut_dataset(split: str):
-    path = _download_wnut_file(split)
-    examples = _parse_wnut_file(path)
-    return Dataset.from_list(examples)
-
-
 def _normalize_ontonotes_split(split: str) -> str:
     normalized = split.lower().strip()
     mapping = {"train": "train", "training": "train", "validation": "development", "dev": "development", "val": "development", "test": "test"}
@@ -439,6 +364,58 @@ def _parse_ontonotes_file(path: Path, label_to_id: dict[str, int]) -> list[dict]
 
 
 def _load_ontonotes_dataset(split: str, config_name: str):
+    normalized_split = _normalize_ontonotes_split(split)
+    try:
+        ds = load_dataset("ontonotes5", config_name, split=normalized_split)
+    except Exception as err:  # pragma: no cover - requires HF download
+        logger.warning("Falling back to local OntoNotes parser due to: %s", err)
+        return _load_ontonotes_dataset_local(split, config_name)
+
+    def _find_column(candidates):
+        for name in candidates:
+            if name in ds.column_names:
+                return name
+        return None
+
+    tokens_field = _find_column(("tokens", "words"))
+    labels_field = _find_column(("ner_tags", "ner", "named_entities"))
+    if tokens_field is None or labels_field is None:
+        raise ValueError(
+            "Unexpected OntoNotes dataset structure; expected token and ner tag columns."
+        )
+    if tokens_field != "tokens":
+        ds = ds.rename_column(tokens_field, "tokens")
+    if labels_field != "ner_tags":
+        ds = ds.rename_column(labels_field, "ner_tags")
+
+    feature = ds.features.get("ner_tags")
+    hf_label_names = None
+    if feature is not None:
+        seq_feature = getattr(feature, "feature", None)
+        hf_label_names = getattr(seq_feature, "names", None)
+
+    def _convert_label(value):
+        if isinstance(value, int):
+            if hf_label_names and 0 <= value < len(hf_label_names):
+                label_name = hf_label_names[value]
+            else:
+                return int(value)
+        else:
+            label_name = str(value)
+        label_name = label_name.strip().upper()
+        try:
+            return ONTONOTES_LABEL_TO_ID[label_name]
+        except KeyError as err:
+            raise ValueError(f"Unknown OntoNotes label '{label_name}'.") from err
+
+    def _standardize(example):
+        example["ner_tags"] = [_convert_label(label) for label in example["ner_tags"]]
+        return example
+
+    return ds.map(_standardize, desc="Standardizing OntoNotes labels")
+
+
+def _load_ontonotes_dataset_local(split: str, config_name: str):
     try:
         language, version = config_name.split("_", 1)
     except ValueError as err:
@@ -644,31 +621,55 @@ def build_dataset(
     shuffle=False,
     cnn_field=None,
     dataset_config=None,
+    raw_dataset_root=None,
 ):
     """
     Generic dataset builder for CNN, WikiANN, CoNLL, WNUT, OntoNotes, BC2GM, and FrameNet.
     """
     # pick dataset + text extraction strategy
+    raw_split_path = None
+    if raw_dataset_root is not None:
+        raw_split_path = Path(raw_dataset_root) / split
+        if not raw_split_path.exists():
+            raise FileNotFoundError(f"Raw dataset split not found at {raw_split_path}")
+
     if name == "cnn":
-        ds = load_dataset("cnn_dailymail", "3.0.0", split=split)
+        if raw_split_path is not None:
+            ds = load_from_disk(str(raw_split_path))
+        else:
+            ds = load_dataset("cnn_dailymail", "3.0.0", split=split)
         if cnn_field is None: cnn_field = "highlights"
         text_fn = lambda x: x[cnn_field]
         keep_labels = []
     elif name == "wikiann":
-        ds = load_dataset("wikiann", "en", split=split)
+        if raw_split_path is not None:
+            ds = load_from_disk(str(raw_split_path))
+        else:
+            ds = load_dataset("wikiann", "en", split=split)
         text_fn = lambda x: " ".join(x["tokens"])
         keep_labels = ["ner_tags", "tokens"]
     elif name == "conll2003":
-        ds = load_dataset("conll2003", revision="refs/convert/parquet", split=split)
+        if raw_split_path is not None:
+            ds = load_from_disk(str(raw_split_path))
+        else:
+            ds = load_dataset("conll2003", revision="refs/convert/parquet", split=split)
         text_fn = lambda x: " ".join(x["tokens"])
         keep_labels = ["ner_tags", "tokens"]
     elif name == "wnut":
-        ds = _load_wnut_dataset(split)
+        if raw_split_path is None:
+            raise RuntimeError(
+                "WNUT requires pre-downloaded raw splits. "
+                "Run `python tools/datasets/download_dataset.py --dataset wnut --output data/raw/wnut` first."
+            )
+        ds = load_from_disk(str(raw_split_path))
         text_fn = lambda x: " ".join(x["tokens"])
         keep_labels = ["ner_tags", "tokens"]
     elif name == "ontonotes":
         config_name = dataset_config or "english_v4"
-        ds = _load_ontonotes_dataset(split, config_name)
+        if raw_split_path is not None:
+            ds = load_from_disk(str(raw_split_path))
+        else:
+            ds = _load_ontonotes_dataset(split, config_name)
         text_fn = lambda x: " ".join(x["tokens"])
         keep_labels = ["ner_tags", "tokens"]
     elif name == "bc2gm":
@@ -681,7 +682,10 @@ def build_dataset(
         keep_labels = ["ner_tags", "tokens"]
     elif name == "framenet":
         config_name = dataset_config or "fulltext"
-        ds = _load_framenet_dataset(split, config_name)
+        if raw_split_path is not None:
+            ds = load_from_disk(str(raw_split_path))
+        else:
+            ds = _load_framenet_dataset(split, config_name)
         text_fn = lambda x: " ".join(x["tokens"])
         keep_labels = ["tokens", "frame_elements", "frame_name", "lexical_units", "lemmas", "pos_tags"]
     else:

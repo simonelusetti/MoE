@@ -18,7 +18,7 @@ source "$REPO_ROOT/tools/slurm/common.sh"
 mkdir -p "$REPO_ROOT/logs/datasets"
 mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE"
 
-python tools/prechache/download.py \
+python tools/precache/download.py \
   --cache-dir "$HF_HOME" \
   --wikiann-langs en \
   --models sentence-transformers/all-MiniLM-L6-v2

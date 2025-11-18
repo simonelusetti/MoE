@@ -1,5 +1,5 @@
 """Utility scripts for RatCon workflows."""
 
-from . import prechache
+from . import precache
 
-__all__ = ["prechache"]
+__all__ = ["precache"]

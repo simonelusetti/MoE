@@ -18,7 +18,7 @@ source "$REPO_ROOT/tools/slurm/common.sh"
 
 mkdir -p "$REPO_ROOT/logs/datasets"
 
-python tools/build_dataset.py \
+python tools/datasets/build_dataset.py \
   --dataset wikiann \
   --splits train \
   --subset 0.1 \

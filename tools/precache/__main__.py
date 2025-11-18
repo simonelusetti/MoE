@@ -1,4 +1,4 @@
-"""Entry-point for `python -m tools.prechache`."""
+"""Entry-point for `python -m tools.precache`."""
 
 from . import main
 

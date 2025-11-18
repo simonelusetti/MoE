@@ -18,4 +18,4 @@ source "$REPO_ROOT/tools/slurm/common.sh"
 
 mkdir -p "$REPO_ROOT/logs/datasets"
 
-python tools/build_dataset.py   --dataset conll2003   --splits train validation   --subset 1.0   --rebuild
+python tools/datasets/build_dataset.py   --dataset conll2003   --splits train validation   --subset 1.0   --rebuild

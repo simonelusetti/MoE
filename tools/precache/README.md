@@ -21,7 +21,7 @@ The precache script manages the `hub/`, `datasets/`, and `transformers/` subfold
 module load python/3.11.7
 source ~/MoE/.venv/bin/activate
 
-python tools/prechache/download.py   --cache-dir "$HF_CACHE_ROOT"   --wikiann-langs en   --models sentence-transformers/all-MiniLM-L6-v2
+python tools/precache/download.py   --cache-dir "$HF_CACHE_ROOT"   --wikiann-langs en   --models sentence-transformers/all-MiniLM-L6-v2
 ```
 
 Script options (pass `--no-verify` to skip the offline check):
@@ -54,21 +54,21 @@ If you prefer jobs to download new artefacts on demand, drop the last three offl
 
 ## Batch helper (optional)
 
-`precache_and_rerun.sbatch` is a sample script for running the download on a compute node and, if desired, re-launching a Dora grid afterwards. Adjust the `#SBATCH` directives and cache path to match your project before submitting:
+`tools/slurm/datasets/precache_and_rerun.sbatch` is a sample script for running the download on a compute node and, if desired, re-launching a Dora grid afterwards. Adjust the `#SBATCH` directives and cache path to match your project before submitting:
 
 ```bash
-sbatch tools/prechache/precache_and_rerun.sbatch
+sbatch tools/slurm/datasets/precache_and_rerun.sbatch
 ```
 
 ## Pre-build processed datasets
 
-Use `tools/build_dataset.py` to materialise the processed MoE datasets under `./data` ahead of time. This mirrors the naming logic in `src/data.py` so the training code can operate purely offline:
+Use `tools/datasets/build_dataset.py` to materialise the processed MoE datasets under `./data` ahead of time. This mirrors the naming logic in `src/data.py` so the training code can operate purely offline:
 
 ```bash
 module load python/3.11.7
 source ~/MoE/.venv/bin/activate
 
-python tools/build_dataset.py --dataset wikiann --splits train validation --subset 0.0
+python tools/datasets/build_dataset.py --dataset wikiann --splits train validation --subset 0.0
 ```
 
 Pass `--rebuild` to force regeneration if a cached dataset already exists.

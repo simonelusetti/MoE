@@ -9,11 +9,21 @@ from typing import Optional, Union
 
 from dora import to_absolute_path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.data import build_dataset
+
+KNOWN_DATASETS = {
+    "cnn": {"config": None, "raw_dir": "cnn_dailymail_3.0.0"},
+    "wikiann": {"config": "en", "raw_dir": "wikiann_en"},
+    "conll2003": {"config": None, "raw_dir": "conll2003"},
+    "wnut": {"config": None, "raw_dir": "wnut"},
+    "ontonotes": {"config": "english_v4", "raw_dir": "ontonotes5_english_v4"},
+    "bc2gm": {"config": None, "raw_dir": "spyysalo_bc2gm_corpus"},
+    "framenet": {"config": "fulltext", "raw_dir": "liyucheng_FrameNet_v17_fulltext"},
+}
 
 
 def _sanitize_fragment(fragment: str) -> str:
@@ -63,6 +73,7 @@ def _prepare_dataset(
     dataset_config: Optional[str],
     rebuild: bool,
     shuffle: bool,
+    raw_root: Optional[str],
 ) -> Path:
     relative = Path("data") / _dataset_filename(name, split, subset, cnn_field, dataset_config)
     target = Path(to_absolute_path(str(relative)))
@@ -89,6 +100,7 @@ def _prepare_dataset(
         shuffle=shuffle,
         cnn_field=cnn_field,
         dataset_config=dataset_config,
+        raw_dataset_root=raw_root,
     )
     dataset.save_to_disk(str(target))
     return target
@@ -96,10 +108,15 @@ def _prepare_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
         "--dataset",
-        choices=("cnn", "wikiann", "conll2003", "wnut", "ontonotes", "bc2gm", "framenet"),
-        required=True,
+        choices=tuple(KNOWN_DATASETS.keys()),
+    )
+    group.add_argument(
+        "--all-known",
+        action="store_true",
+        help="Build caches for every dataset in KNOWN_DATASETS.",
     )
     parser.add_argument("--splits", nargs="+", default=["train"], help="Dataset splits to prepare (default: %(default)s)")
     parser.add_argument("--subset", default=None, help="Subset value matching src.data expectations (e.g. 0.1, 1000, None)")
@@ -113,27 +130,64 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--shuffle", action="store_true", help="Shuffle dataset before saving")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuilding even if cache exists")
+    parser.add_argument(
+        "--raw-root",
+        default=None,
+        help="Optional directory containing raw splits (downloaded via download_dataset.py).",
+    )
     return parser.parse_args()
+
+
+def _resolve_raw_root(base_path, raw_dir, splits, name):
+    base = Path(base_path)
+    first_split = splits[0]
+    candidates = [base]
+    if raw_dir:
+        candidates.append(base / raw_dir)
+    for candidate in candidates:
+        if (candidate / first_split).exists():
+            return str(candidate)
+    raise FileNotFoundError(
+        f"Raw dataset splits for '{name}' not found under {base}. "
+        f"Ensure you downloaded them (e.g., data/raw/{raw_dir}/{first_split})."
+    )
 
 
 def main() -> None:
     args = parse_args()
     subset = _parse_subset(args.subset)
-    cnn_field = args.cnn_field
-    if args.dataset == "cnn" and cnn_field is None:
-        cnn_field = "highlights"
-    dataset_config = args.config
-    if args.dataset == "framenet":
-        if dataset_config is None:
-            dataset_config = "fulltext"
-    elif args.dataset == "ontonotes" and dataset_config is None:
-        dataset_config = "english_v4"
+    targets = []
+    if args.all_known:
+        for name, entry in KNOWN_DATASETS.items():
+            targets.append((name, entry))
+    else:
+        entry = KNOWN_DATASETS.get(args.dataset, {"config": args.config, "raw_dir": None})
+        if args.config is not None:
+            entry = dict(entry)
+            entry["config"] = args.config
+        targets.append((args.dataset, entry))
 
     prepared = []
-    for split in args.splits:
-        path = _prepare_dataset(
-            name=args.dataset,
-            split=split,
+    for name, entry in targets:
+        cnn_field = args.cnn_field
+        dataset_config = entry.get("config")
+        if name == "cnn" and cnn_field is None:
+            cnn_field = "highlights"
+        if name == "framenet" and dataset_config is None:
+            dataset_config = "fulltext"
+        if name == "ontonotes" and dataset_config is None:
+            dataset_config = "english_v4"
+        dataset_raw_root = args.raw_root
+        if dataset_raw_root is not None:
+            try:
+                dataset_raw_root = _resolve_raw_root(dataset_raw_root, entry.get("raw_dir"), args.splits, name)
+            except FileNotFoundError as err:
+                print(f"[skip] {err}")
+                continue
+        for split in args.splits:
+            path = _prepare_dataset(
+                name=name,
+                split=split,
             subset=subset,
             tokenizer=args.tokenizer,
             max_length=args.max_length,
@@ -141,8 +195,9 @@ def main() -> None:
             dataset_config=dataset_config,
             rebuild=args.rebuild,
             shuffle=args.shuffle,
+                raw_root=dataset_raw_root,
         )
-        prepared.append(path)
+            prepared.append(path)
 
     print("\nPrepared datasets:")
     for path in prepared:
