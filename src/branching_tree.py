@@ -20,7 +20,6 @@ class BranchNode:
     selector: RationaleSelectorModel
     expert: ExpertModel
     children: list["BranchNode"] = field(default_factory=list)
-    trainable: bool = True
 
 
 @dataclass
@@ -63,7 +62,11 @@ def build_branch_tree(
     device,
     selector_backbone,
     expert_backbone,
+    max_stage=None,
 ):
+    if max_stage is None:
+        max_stage = num_stages
+    max_stage = max(1, min(int(max_stage), num_stages))
     selector_pooler_template, selector_hidden_dim, selector_null_embedding = selector_backbone
     expert_pooler_template, expert_hidden_dim = expert_backbone
     nodes: list[BranchNode] = []
@@ -86,23 +89,21 @@ def build_branch_tree(
             pooler=expert_pooler,
             embedding_dim=expert_hidden_dim,
         ).to(device)
-        trainable = stage == num_stages - 1
         node = BranchNode(
             stage=stage,
             path=path,
             selector=selector,
             expert=expert,
             children=[],
-            trainable=trainable,
         )
-        if not trainable:
+        if stage < max_stage - 1:
             for param in node.selector.parameters():
                 param.requires_grad_(False)
             for param in node.expert.parameters():
                 param.requires_grad_(False)
         path_to_node[path] = node
         nodes.append(node)
-        if stage + 1 < num_stages:
+        if stage + 1 < max_stage:
             for idx in range(num_factors):
                 child_path = path + (idx,)
                 child = _build(stage + 1, child_path)
@@ -286,15 +287,16 @@ def evaluate_leaf_on_loader(trainer, leaf_name, loader, logger, tag: str | None 
     if path is None:
         logger.warning("Leaf %s not found; cannot run dev evaluation.", leaf_name)
         return None
-    if len(path) != trainer.num_stages:
+    expected_depth = trainer.current_depth if getattr(trainer, "stagewise", False) else trainer.num_stages
+    if len(path) != expected_depth:
         logger.warning(
             "Leaf %s path length mismatch; expected %d got %d.",
             leaf_name,
-            trainer.num_stages,
+            expected_depth,
             len(path),
         )
         return None
-    node_paths = [tuple(path[:i]) for i in range(trainer.num_stages)]
+    node_paths = [tuple(path[:i]) for i in range(expected_depth)]
     nodes = []
     for node_path in node_paths:
         node = trainer.path_to_node.get(node_path)

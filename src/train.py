@@ -32,7 +32,6 @@ class ExpertTrainer:
             "overlap": float(weights_cfg.overlap),
             "diversity": float(weights_cfg.diversity),
             "balance": float(weights_cfg.balance),
-            "attention": float(weights_cfg.attention),
         }
         if cfg.model.expert.use_continuity:
             weights["continuity"] = float(weights_cfg.continuity)
@@ -66,12 +65,6 @@ class ExpertTrainer:
         overlap_loss = outputs["overlap"].mean()
         diversity_loss = outputs["diversity"]
         balance_loss = outputs["balance"]
-        attention_loss = outputs.get("attention_entropy")
-        if attention_loss is not None:
-            attention_loss = attention_loss.mean()
-        else:
-            attention_loss = embeddings.new_tensor(0.0)
-
         loss_components = {
             "sent": sent_loss,
             "token": token_loss,
@@ -79,7 +72,6 @@ class ExpertTrainer:
             "overlap": overlap_loss,
             "diversity": diversity_loss,
             "balance": balance_loss,
-            "attention": attention_loss,
         }
 
         if "continuity" in self.weights:

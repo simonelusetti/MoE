@@ -5,7 +5,7 @@ model:
   sbert_name: "sentence-transformers/all-MiniLM-L6-v2"
   contrastive_tau: 0.07
   expert:
-    num_experts: 4
+    num_experts: 2
     routing: "softmax"
     routing_tau: 1.0
     normalize: True

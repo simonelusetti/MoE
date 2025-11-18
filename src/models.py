@@ -28,7 +28,6 @@ class ExpertModel(nn.Module):
         self.use_balance = expert_cfg.use_balance
         self.use_diversity = expert_cfg.use_diversity
         self.use_continuity = bool(expert_cfg.use_continuity)
-        self.use_attention = bool(expert_cfg.use_attention)
 
         if pooler is not None and embedding_dim is not None:
             self.sbert = None
@@ -42,23 +41,8 @@ class ExpertModel(nn.Module):
         factor_dim = int(expert_cfg.factor_dim)
         factor_hidden = int(expert_cfg.factor_hidden)
         self.factor_dim = factor_dim
-        if self.use_attention:
-            attn_heads = int(expert_cfg.attention_heads)
-            attn_dropout = float(expert_cfg.attention_dropout)
-            if factor_dim % attn_heads != 0:
-                raise ValueError(
-                    "expert.factor_dim must be divisible by attention_heads when attention is enabled."
-                )
-            self.expert_attention = nn.MultiheadAttention(
-                embed_dim=factor_dim,
-                num_heads=attn_heads,
-                dropout=attn_dropout,
-                batch_first=True,
-            )
-            self.attention_layer_norm = nn.LayerNorm(factor_dim)
-        else:
-            self.expert_attention = None
-            self.attention_layer_norm = None
+        self.expert_attention = None
+        self.attention_layer_norm = None
 
         gate_hidden = int(expert_cfg.gate_hidden)
         gate_dropout = float(expert_cfg.gate_dropout)
@@ -183,20 +167,6 @@ class ExpertModel(nn.Module):
         if self.normalize_factors:
             factors_raw = factors_raw / mass
         transformed_factors = self._transform_factors(factors_raw)
-        if self.expert_attention is not None:
-            attn_output, attn_weights = self.expert_attention(
-                transformed_factors,
-                transformed_factors,
-                transformed_factors,
-                need_weights=True,
-            )
-            transformed_factors = self.attention_layer_norm(transformed_factors + attn_output)
-            attn_weights_safe = attn_weights.clamp_min(self.small_value)
-            attention_entropy = -(attn_weights_safe * attn_weights_safe.log()).sum(dim=-1)
-            attention_entropy = attention_entropy.mean(dim=-1)
-        else:
-            attn_weights = None
-            attention_entropy = transformed_factors.new_zeros(transformed_factors.size(0))
 
         pooled = self.pooler(
             {
@@ -259,10 +229,8 @@ class ExpertModel(nn.Module):
             "overlap": overlap,
             "balance": balance,
             "diversity": diversity,
-            "attention_entropy": attention_entropy,
+            "attention_entropy": None,
         }
         if self.use_continuity:
             outputs["continuity"] = continuity
-        if attn_weights is not None:
-            outputs["attention_weights"] = attn_weights
         return outputs

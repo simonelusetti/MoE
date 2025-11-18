@@ -64,59 +64,117 @@ class BranchingCompositeTrainer:
 
         self.contrastive_tau = float(self.model_cfg.contrastive_tau)
 
-        selector_backbone = prepare_selector_backbone(self.selector_cfg)
-        expert_backbone = prepare_expert_backbone(self.model_cfg)
-        (
-            self.root,
-            self.nodes,
-            self.path_to_node,
-            self.leaf_name_to_path,
-        ) = build_branch_tree(
-            self.selector_cfg,
-            self.model_cfg,
-            self.num_stages,
-            self.num_factors,
-            self.device,
-            selector_backbone,
-            expert_backbone,
-        )
+        self.selector_backbone = prepare_selector_backbone(self.selector_cfg)
+        self.expert_backbone = prepare_expert_backbone(self.model_cfg)
         self.leaf_dev_metrics: dict[str, dict[str, float]] = {}
         self.dev_eval_top_k = 10
+        self.stagewise = bool(getattr(cfg.composite, "stagewise", False))
+        stage_epochs_cfg = getattr(cfg.composite, "stage_epochs", None)
+        if stage_epochs_cfg:
+            self.stage_epochs = [int(x) for x in stage_epochs_cfg]
+        else:
+            self.stage_epochs = [cfg.train.epochs] * self.num_stages
+        initial_depth = 1 if self.stagewise else self.num_stages
+        self.active_stage = initial_depth - 1
+        self.current_depth = initial_depth
 
-        selector_params = [
-            param
-            for node in self.nodes
-            for param in node.selector.parameters()
-            if param.requires_grad
-        ]
-        expert_params = [
-            param
-            for node in self.nodes
-            for param in node.expert.parameters()
-            if param.requires_grad
-        ]
-        self.selector_params = selector_params
-        self.expert_params = expert_params
-
-        sel_optim_cfg = self.selector_cfg.optim
-        self.selector_optimizer = torch.optim.AdamW(
-            selector_params,
-            lr=float(sel_optim_cfg.lr),
-            weight_decay=float(sel_optim_cfg.weight_decay),
-            betas=tuple(sel_optim_cfg.betas),
-        )
-
-        exp_optim_cfg = self.model_cfg.optim
-        self.expert_optimizer = torch.optim.AdamW(
-            expert_params,
-            lr=exp_optim_cfg.lr,
-            weight_decay=exp_optim_cfg.weight_decay,
-            betas=exp_optim_cfg.betas,
-        )
+        self.sel_optim_cfg = self.selector_cfg.optim
+        self.exp_optim_cfg = self.model_cfg.optim
+        self._build_tree_to_depth(initial_depth)
 
     def train(self, train_dl, eval_dl, dev_dl, logger, xp):
         disable_progress = should_disable_tqdm()
+
+        if self.stagewise:
+            stage_epochs = (
+                self.stage_epochs
+                if len(self.stage_epochs) >= self.num_stages
+                else self.stage_epochs + [self.stage_epochs[-1]] * (self.num_stages - len(self.stage_epochs))
+            )
+            prev_state = None
+            for stage in range(self.num_stages):
+                depth = stage + 1
+                self._build_tree_to_depth(depth)
+                self._set_active_stage(stage)
+                if prev_state:
+                    self._load_state_from_dict(prev_state)
+                logger.info("Training stage %d/%d", stage + 1, self.num_stages)
+                last_selector_avg = None
+                last_expert_avg = None
+                for epoch in range(stage_epochs[stage]):
+                    last_selector_avg, last_expert_avg = self._run_train_epoch(
+                        train_dl, disable_progress, epoch, stage_label=f"Stage {stage + 1}"
+                    )
+
+                if last_selector_avg:
+                    self._log_metrics_table(
+                        f"Selector Train (stage {stage + 1})", last_selector_avg, logger
+                    )
+                    xp.link.push_metrics(
+                        {f"branch/stage_{stage + 1}/train_selector": last_selector_avg}
+                    )
+                if last_expert_avg:
+                    self._log_metrics_table(
+                        f"Expert Train (stage {stage + 1})", last_expert_avg, logger
+                    )
+                    xp.link.push_metrics(
+                        {f"branch/stage_{stage + 1}/train_expert": last_expert_avg}
+                    )
+
+                if eval_dl is not None:
+                    eval_results = self.evaluate(eval_dl, logger, log_to_xp=False)
+                    selector_eval = eval_results["selector_avg"]
+                    expert_eval = eval_results["expert_avg"]
+                    leaf_metrics = eval_results["leaf_metrics"]
+                    ranked_leaves = sorted_leaves(leaf_metrics)
+
+                    self._log_metrics_table(
+                        f"Selector Eval (stage {stage + 1})", selector_eval, logger
+                    )
+                    self._log_metrics_table(
+                        f"Expert Eval (stage {stage + 1})", expert_eval, logger
+                    )
+                    log_f1_table(f"Leaf Factors Eval (stage {stage + 1})", leaf_metrics, logger)
+
+                    xp.link.push_metrics({f"branch/stage_{stage + 1}/eval_selector": selector_eval})
+                    xp.link.push_metrics({f"branch/stage_{stage + 1}/eval_expert": expert_eval})
+
+                    if dev_dl is not None:
+                        epoch_dev_metrics = {}
+                        for leaf, _ in ranked_leaves[: self.dev_eval_top_k]:
+                            dev_metrics = evaluate_leaf_on_loader(
+                                self, leaf, dev_dl, logger, tag=f"stage {stage + 1}"
+                            )
+                            if dev_metrics:
+                                self.leaf_dev_metrics[leaf] = dev_metrics
+                                epoch_dev_metrics[leaf] = dev_metrics
+                        if epoch_dev_metrics:
+                            best_dev_leaf = best_leaf(epoch_dev_metrics)
+                            if best_dev_leaf:
+                                dev_leaf_name, dev_leaf_stats = best_dev_leaf
+                                xp.link.push_metrics(
+                                    {f"branch/stage_{stage + 1}/dev_leaf": {dev_leaf_name: dev_leaf_stats}}
+                                )
+
+                    log_leaf_ranking(
+                        title=f"Leaf Factors Eval (stage {stage + 1})",
+                        metrics_dict=leaf_metrics,
+                        logger=logger,
+                        top_k=self.dev_eval_top_k,
+                        dev_metrics=self.leaf_dev_metrics,
+                        sorted_items=ranked_leaves,
+                    )
+
+                self._save_checkpoint(logger)
+
+                prev_state = self._snapshot_state()
+                logger.info("Completed stage %d training.", stage + 1)
+
+            self._set_active_stage(self.num_stages - 1)
+            return
+
         best_eval = float("inf")
+        self._set_active_stage(self.num_stages - 1)
 
         for epoch in range(self.cfg.train.epochs):
             selector_avg, expert_avg = self._run_train_epoch(train_dl, disable_progress, epoch)
@@ -187,7 +245,7 @@ class BranchingCompositeTrainer:
         if eval_dl is None:
             self._save_checkpoint(logger)
 
-    def _run_train_epoch(self, loader, disable_progress, epoch_index: int):
+    def _run_train_epoch(self, loader, disable_progress, epoch_index: int, stage_label: str | None = None):
         selector_sums = defaultdict(float)
         selector_counts = defaultdict(int)
         expert_sums = defaultdict(float)
@@ -195,14 +253,14 @@ class BranchingCompositeTrainer:
 
         self._set_mode(train=True)
 
-        iterator = tqdm(
-            loader,
-            desc=f"Branch Composite Train {epoch_index + 1}",
-            disable=disable_progress,
-        )
+        desc = f"Branch Composite Train {epoch_index + 1}"
+        if stage_label:
+            desc = f"{stage_label} {desc}"
+        iterator = tqdm(loader, desc=desc, disable=disable_progress)
         for batch in iterator:
             tensors = prepare_batch(batch, self.device)
-            selector_loss, expert_loss = self._forward_batch(
+            selector_loss, expert_loss = self._forward_node(
+                self.root,
                 tensors.embeddings,
                 tensors.attention_mask,
                 selector_sums,
@@ -244,7 +302,8 @@ class BranchingCompositeTrainer:
             iterator = tqdm(loader, desc="Branch Composite Eval", disable=disable_progress)
             for batch in iterator:
                 tensors = prepare_batch(batch, self.device, require_labels=True)
-                self._forward_batch(
+                _, _ = self._forward_node(
+                    self.root,
                     tensors.embeddings,
                     tensors.attention_mask,
                     selector_sums,
@@ -274,37 +333,6 @@ class BranchingCompositeTrainer:
             "leaf_metrics": leaf_metrics,
         }
 
-    def _forward_batch(
-        self,
-        embeddings,
-        mask,
-        selector_sums,
-        selector_counts,
-        expert_sums,
-        expert_counts,
-        *,
-        training,
-        ner_tags=None,
-        leaf_stats=None,
-        leaf_per_class=None,
-        label_groups=None,
-    ):
-        selector_loss, expert_loss = self._forward_node(
-            self.root,
-            embeddings,
-            mask,
-            selector_sums,
-            selector_counts,
-            expert_sums,
-            expert_counts,
-            training=training,
-            ner_tags=ner_tags,
-            leaf_stats=leaf_stats,
-            leaf_per_class=leaf_per_class,
-            label_groups=label_groups,
-        )
-        return selector_loss, expert_loss
-
     def _forward_node(
         self,
         node: BranchNode,
@@ -321,10 +349,13 @@ class BranchingCompositeTrainer:
         leaf_per_class=None,
         label_groups=None,
     ):
-        if mask.sum() == 0:
-            return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+        if mask.sum() == 0 or (self.stagewise and node.stage > self.active_stage):
+            zero = embeddings.new_zeros(())
+            return zero, zero
 
-        context = torch.enable_grad if (training and node.trainable) else torch.no_grad
+        treated_as_leaf = self._node_is_active_leaf(node)
+        train_current = training and treated_as_leaf
+        context = torch.enable_grad if train_current else torch.no_grad
         with context():
             selector_loss, selector_metrics, selector_out = self._selector_forward(
                 node.selector, embeddings, mask
@@ -340,10 +371,11 @@ class BranchingCompositeTrainer:
             )
             update_epoch_metrics(expert_sums, expert_counts, expert_metrics)
 
-        selector_total = selector_loss
-        expert_total = expert_loss
+        selector_total = selector_loss if train_current else selector_loss.new_zeros(())
+        expert_total = expert_loss if train_current else expert_loss.new_zeros(())
 
-        if node.children:
+        descend_children = (not self.stagewise) or (self.stagewise and self.active_stage > node.stage)
+        if node.children and descend_children:
             predictions = expert_out["pi"].argmax(dim=-1)
             valid = selected_mask > 0
             for idx, child in enumerate(node.children):
@@ -352,7 +384,7 @@ class BranchingCompositeTrainer:
                     continue
                 child_mask = child_bool.long()
                 child_embeddings = selected_embeddings * child_bool.unsqueeze(-1).to(selected_embeddings.dtype)
-                c_sel, c_exp = self._forward_node(
+                child_sel, child_exp = self._forward_node(
                     child,
                     child_embeddings,
                     child_mask,
@@ -366,24 +398,22 @@ class BranchingCompositeTrainer:
                     leaf_per_class=leaf_per_class,
                     label_groups=label_groups,
                 )
-                selector_total = selector_total + c_sel
-                expert_total = expert_total + c_exp
-        else:
-            if ner_tags is not None and leaf_stats is not None:
-                accumulate_leaf_stats(
-                    self.leaf_name_to_path,
-                    self.num_factors,
-                    leaf_stats,
-                    leaf_per_class,
-                    expert_out["pi"],
-                    selected_mask,
-                    ner_tags,
-                    node.path,
-                    label_groups,
-                )
+                selector_total = selector_total + child_sel
+                expert_total = expert_total + child_exp
+        if treated_as_leaf and ner_tags is not None and leaf_stats is not None:
+            accumulate_leaf_stats(
+                self.leaf_name_to_path,
+                self.num_factors,
+                leaf_stats,
+                leaf_per_class,
+                expert_out["pi"],
+                selected_mask,
+                ner_tags,
+                node.path,
+                label_groups,
+            )
 
         return selector_total, expert_total
-
     def _selector_forward(self, selector, tokens, mask):
         outputs = selector(tokens, mask)
         h_anchor = outputs["h_anchor"]
@@ -443,12 +473,7 @@ class BranchingCompositeTrainer:
         overlap_loss = outputs["overlap"].mean()
         diversity_loss = outputs["diversity"]
         balance_loss = outputs["balance"]
-        attention_loss = outputs.get("attention_entropy")
-        if attention_loss is not None:
-            attention_loss = attention_loss.mean()
-        else:
-            attention_loss = embeddings.new_tensor(0.0)
-
+        continuity = outputs.get("continuity")
         loss_components = {
             "sent": sent_loss,
             "token": token_loss,
@@ -456,21 +481,9 @@ class BranchingCompositeTrainer:
             "overlap": overlap_loss,
             "diversity": diversity_loss,
             "balance": balance_loss,
-            "attention": attention_loss,
+            "continuity": continuity.mean() if continuity is not None else None,
         }
 
-        weights = self._expert_loss_weights()
-        if "continuity" in weights:
-            if "continuity" not in outputs:
-                raise KeyError("Continuity weight configured but ExpertModel continuity output missing.")
-            loss_components["continuity"] = outputs["continuity"].mean()
-
-        total_loss = sum(weights[key] * loss_components[key] for key in loss_components)
-        metrics = {key: float(value.detach()) for key, value in loss_components.items()}
-        metrics["total"] = float(total_loss.detach())
-        return total_loss, metrics, outputs
-
-    def _expert_loss_weights(self):
         weights_cfg = self.model_cfg.loss_weights
         weights = {
             "sent": float(weights_cfg.sent),
@@ -479,11 +492,19 @@ class BranchingCompositeTrainer:
             "overlap": float(weights_cfg.overlap),
             "diversity": float(weights_cfg.diversity),
             "balance": float(weights_cfg.balance),
-            "attention": float(weights_cfg.attention),
+            "continuity": float(weights_cfg.continuity),
         }
-        if self.model_cfg.expert.use_continuity:
-            weights["continuity"] = float(weights_cfg.continuity)
-        return weights
+
+        total_loss = sum(
+            weights[key] * loss_components[key]
+            for key in loss_components
+            if loss_components[key] is not None
+        )
+        metrics = {
+            key: float(value.detach()) for key, value in loss_components.items() if value is not None
+        }
+        metrics["total"] = float(total_loss.detach())
+        return total_loss, metrics, outputs
 
     def _build_selection_mask(self, gates: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         mask_float = attention_mask.to(dtype=gates.dtype)
@@ -500,12 +521,120 @@ class BranchingCompositeTrainer:
 
     def _set_mode(self, train: bool):
         for node in self.nodes:
-            if train and node.trainable:
+            train_current = train and self._node_is_active_leaf(node)
+            if train_current:
                 node.selector.train()
                 node.expert.train()
             else:
                 node.selector.eval()
                 node.expert.eval()
+
+    def _set_active_stage(self, stage: int):
+        stage = max(0, min(stage, self.num_stages - 1))
+        self.active_stage = stage
+        self._update_trainable_params()
+
+    def _node_is_active_leaf(self, node: BranchNode) -> bool:
+        if self.stagewise:
+            return node.stage == self.active_stage
+        return not node.children
+
+    def _update_trainable_params(self):
+        selector_params = []
+        expert_params = []
+        for node in getattr(self, "nodes", []):
+            enable = self._node_is_active_leaf(node)
+            for param in node.selector.parameters():
+                param.requires_grad = enable
+            for param in node.expert.parameters():
+                param.requires_grad = enable
+            if enable:
+                selector_params.extend(node.selector.parameters())
+                expert_params.extend(node.expert.parameters())
+        self.selector_params = selector_params
+        self.expert_params = expert_params
+        self.selector_optimizer = torch.optim.AdamW(
+            self.selector_params,
+            lr=float(self.sel_optim_cfg.lr),
+            weight_decay=float(self.sel_optim_cfg.weight_decay),
+            betas=tuple(self.sel_optim_cfg.betas),
+        )
+        self.expert_optimizer = torch.optim.AdamW(
+            self.expert_params,
+            lr=self.exp_optim_cfg.lr,
+            weight_decay=self.exp_optim_cfg.weight_decay,
+            betas=self.exp_optim_cfg.betas,
+        )
+
+    def _snapshot_state(self):
+        return {
+            "selectors": {self._path_key(node.path): node.selector.state_dict() for node in self.nodes},
+            "experts": {self._path_key(node.path): node.expert.state_dict() for node in self.nodes},
+        }
+
+    def _load_state_from_dict(self, state):
+        selectors = state.get("selectors", {})
+        experts = state.get("experts", {})
+        for node in self.nodes:
+            key = self._path_key(node.path)
+            if key in selectors:
+                node.selector.load_state_dict(selectors[key], strict=False)
+            if key in experts:
+                node.expert.load_state_dict(experts[key], strict=False)
+
+    def _build_tree_to_depth(self, depth: int):
+        depth = max(1, min(depth, self.num_stages))
+        self.current_depth = depth
+        (
+            self.root,
+            self.nodes,
+            self.path_to_node,
+            self.leaf_name_to_path,
+        ) = build_branch_tree(
+            self.selector_cfg,
+            self.model_cfg,
+            self.num_stages,
+            self.num_factors,
+            self.device,
+            self.selector_backbone,
+            self.expert_backbone,
+            max_stage=depth,
+        )
+        self._update_trainable_params()
+
+    def _node_is_active_leaf(self, node: BranchNode) -> bool:
+        if self.stagewise:
+            return node.stage == self.active_stage
+        return not node.children
+
+    def _update_trainable_params(self):
+        selector_params = []
+        expert_params = []
+        for node in self.nodes:
+            enable = self._node_is_active_leaf(node)
+            for param in node.selector.parameters():
+                param.requires_grad = enable
+            for param in node.expert.parameters():
+                param.requires_grad = enable
+            if enable:
+                selector_params.extend(node.selector.parameters())
+                expert_params.extend(node.expert.parameters())
+
+        self.selector_params = selector_params
+        self.expert_params = expert_params
+
+        self.selector_optimizer = torch.optim.AdamW(
+            self.selector_params,
+            lr=float(self.sel_optim_cfg.lr),
+            weight_decay=float(self.sel_optim_cfg.weight_decay),
+            betas=tuple(self.sel_optim_cfg.betas),
+        )
+        self.expert_optimizer = torch.optim.AdamW(
+            self.expert_params,
+            lr=self.exp_optim_cfg.lr,
+            weight_decay=self.exp_optim_cfg.weight_decay,
+            betas=self.exp_optim_cfg.betas,
+        )
 
     def _save_checkpoint(self, logger):
         state = {
@@ -520,11 +649,10 @@ class BranchingCompositeTrainer:
         path = "branching_composite.pth"
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint not found at {path}")
+        self._build_tree_to_depth(self.num_stages)
+        self._set_active_stage(self.num_stages - 1)
         state = torch.load(path, map_location=self.device)
-        for node in self.nodes:
-            key = self._path_key(node.path)
-            node.selector.load_state_dict(state["selectors"][key])
-            node.expert.load_state_dict(state["experts"][key])
+        self._load_state_from_dict(state)
         logger.info("Loaded branching composite checkpoints from %s", path)
 
     @staticmethod
