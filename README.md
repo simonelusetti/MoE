@@ -43,6 +43,36 @@ with non-negative weights `λ_*`.
 - Expert embeddings `tilde z_k`
 - Per-factor precision/recall/F1 (when labels exist)
 
+## Exploration Utilities
+
+The exploratory scripts (factor analysis, pretty-printing, annotation helpers) now live under `../exploration`. Clone or open that directory alongside this one to run commands such as:
+
+```
+cd ../exploration
+python analyze_factors.py --dataset <path> --xp_signature <sig>
+```
+
+## Tooling Scripts
+
+All auxiliary tooling (dataset builders, precache scripts, Slurm launchers, pseudo-grid runners) has been moved to `../tools`. To use them:
+
+```
+cd ../tools
+python datasets/build_dataset.py --dataset wikiann --splits train validation --subset 0.1
+python runners/pseudo_grid.py --extra train.epochs=5
+```
+
+Adjust paths in this repo accordingly (e.g., references to `tools/...` now mean `../tools/...`).
+
+## Branching Trainers
+
+The branching/composite training code now lives under `../branching`. Those scripts import the core MoE components via the sibling path, so run them from that repository:
+
+```
+cd ../branching
+python src/train_composite_branching.py --config-path ../MoE/src/conf --config-name composite
+```
+
 ## Product-Manifold Project
 
 The token-level product-manifold projector has been extracted into its own project under `product_manifold/`. Install its requirements (`pip install -r product_manifold/requirements.txt`), build the cached datasets if needed (`python product_manifold/tools/datasets/build_dataset.py ...`), then launch training with `dora --package src --main_module train run` from inside `product_manifold`. SLURM helpers for that workflow now live in `product_manifold/tools/slurm/`.

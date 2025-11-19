@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: moe-trainer
+Version: 0.1.0
+Summary: Mixture-of-experts training code
+Author: MoE Authors
+Requires-Python: >=3.10
+Requires-Dist: dora-search
+Requires-Dist: hydra-core
+Requires-Dist: transformers
+Requires-Dist: sentence-transformers
+Requires-Dist: datasets
+Requires-Dist: spacy
+Requires-Dist: tabulate
+Requires-Dist: pandas
+Requires-Dist: pyyaml
+Requires-Dist: tqdm
+Requires-Dist: prettytable

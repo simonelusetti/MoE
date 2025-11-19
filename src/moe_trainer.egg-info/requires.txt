@@ -1,0 +1,11 @@
+dora-search
+hydra-core
+transformers
+sentence-transformers
+datasets
+spacy
+tabulate
+pandas
+pyyaml
+tqdm
+prettytable

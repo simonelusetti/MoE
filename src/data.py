@@ -505,7 +505,7 @@ def build_dataset(
         if raw_split_path is None:
             raise RuntimeError(
                 "WNUT requires pre-downloaded raw splits. "
-                "Run `python tools/datasets/download_dataset.py --dataset wnut --output data/raw/wnut` first."
+                "Run `python ../tools/datasets/download_dataset.py --dataset wnut --output data/raw/wnut` first."
             )
         ds = load_from_disk(str(raw_split_path))
         text_fn = lambda x: " ".join(x["tokens"])
@@ -530,7 +530,7 @@ def build_dataset(
         if raw_split_path is None:
             raise RuntimeError(
                 "FrameNet requires pre-downloaded raw splits. "
-                "Run `python tools/datasets/download_dataset.py --dataset framenet --output data/raw` first."
+                "Run `python ../tools/datasets/download_dataset.py --dataset framenet --output data/raw` first."
             )
         ds = load_from_disk(str(raw_split_path))
         text_fn = lambda x: " ".join(x["tokens"])
@@ -696,18 +696,22 @@ def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
     tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
     if rebuild:
-        raise RuntimeError("Dataset rebuilds are handled by tools/build_dataset.py. Run it before launching training.")
+        raise RuntimeError(
+            "Dataset rebuilds are handled by ../tools/datasets/build_dataset.py. Run it before launching training."
+        )
 
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"Dataset cache {path} not found. Run `tools/build_dataset.py --dataset {name} --splits {split}` to materialise it."
+            f"Dataset cache {path} not found. Run `../tools/datasets/build_dataset.py --dataset {name} --splits {split}` to materialise it."
         )
 
     logger.info(f"Loading cached dataset from {path}")
     try:
         ds = load_from_disk(path)
     except (FileNotFoundError, ValueError) as err:
-        raise RuntimeError("Dataset cache is unreadable. Rebuild it with tools/build_dataset.py.") from err
+        raise RuntimeError(
+            "Dataset cache is unreadable. Rebuild it with ../tools/datasets/build_dataset.py."
+        ) from err
 
     if shuffle:
         ds = ds.shuffle(seed=42)
