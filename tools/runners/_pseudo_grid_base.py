@@ -39,13 +39,16 @@ class GridJob:
         overrides = [
             f"data.train.dataset={self.dataset}",
             f"data.eval.dataset={self.dataset}",
+            f"data.dev.dataset={self.dataset}",
         ]
         if self.subset is not None:
             overrides.append(f"data.train.subset={self.subset}")
             overrides.append(f"data.eval.subset={self.subset}")
+            overrides.append(f"data.dev.subset={self.subset}")
         if self.config is not None:
             overrides.append(f"data.train.config={self.config}")
             overrides.append(f"data.eval.config={self.config}")
+            overrides.append(f"data.dev.config={self.config}")
         overrides.extend(self.extra_overrides)
         return overrides
 

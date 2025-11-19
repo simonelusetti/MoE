@@ -1,4 +1,5 @@
 import argparse
+import ast
 import json
 from pathlib import Path
 
@@ -21,12 +22,27 @@ COLORS = [
 ]
 
 
+def _decode_token(token):
+    if token.startswith("b'") or token.startswith('b"'):
+        try:
+            literal = ast.literal_eval(token)
+            if isinstance(literal, bytes):
+                return literal.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+    return token
+
+
 def load_records(path):
     with Path(path).open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
-            yield json.loads(line)
+            record = json.loads(line)
+            tokens = record.get("tokens")
+            if tokens:
+                record["tokens"] = [_decode_token(tok) for tok in tokens]
+            yield record
 
 
 def color_for_expert(expert):

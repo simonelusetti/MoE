@@ -2,6 +2,7 @@
 """Pre-build MoE dataset caches under ./data."""
 
 import argparse
+import ast
 import shutil
 import sys
 from pathlib import Path
@@ -22,8 +23,26 @@ KNOWN_DATASETS = {
     "wnut": {"config": None, "raw_dir": "wnut"},
     "ontonotes": {"config": "english_v4", "raw_dir": "ontonotes5_english_v4"},
     "bc2gm": {"config": None, "raw_dir": "spyysalo_bc2gm_corpus"},
-    "framenet": {"config": "fulltext", "raw_dir": "liyucheng_FrameNet_v17_fulltext"},
+    "framenet": {"config": "fulltext", "raw_dir": "framenet"},
 }
+
+
+def _decode_token_value(value: str) -> str:
+    if value.startswith("b'") or value.startswith('b"'):
+        try:
+            literal = ast.literal_eval(value)
+            if isinstance(literal, bytes):
+                return literal.decode("utf-8", errors="ignore")
+        except (SyntaxError, ValueError, UnicodeDecodeError):
+            return value
+    return value
+
+
+def _clean_framenet_tokens(row):
+    tokens = row.get("tokens")
+    if tokens:
+        row["tokens"] = [_decode_token_value(token) for token in tokens]
+    return row
 
 
 def _sanitize_fragment(fragment: str) -> str:
@@ -102,6 +121,8 @@ def _prepare_dataset(
         dataset_config=dataset_config,
         raw_dataset_root=raw_root,
     )
+    if name == "framenet":
+        dataset = dataset.map(_clean_framenet_tokens, load_from_cache_file=False)
     dataset.save_to_disk(str(target))
     return target
 

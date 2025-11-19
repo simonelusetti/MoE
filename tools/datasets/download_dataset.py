@@ -10,7 +10,8 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
-from datasets import Dataset, DatasetDict, DatasetInfo, load_dataset
+from datasets import Dataset, load_dataset
+from huggingface_hub import hf_hub_download
 
 WNUT_URLS = {
     "train": "https://raw.githubusercontent.com/leondz/emerging_entities_17/master/wnut17train.conll",
@@ -34,6 +35,15 @@ WNUT_LABEL_NAMES = [
     "I-product",
 ]
 WNUT_LABEL_TO_ID = {label: idx for idx, label in enumerate(WNUT_LABEL_NAMES)}
+
+FRAMENET_REPO_ID = "liyucheng/FrameNet_v17"
+FRAMENET_CONFIG_FILES = {
+    "fulltext": {
+        "train": "fn1.7/fn1.7.fulltext.train.syntaxnet.conll",
+        "validation": "fn1.7/fn1.7.dev.syntaxnet.conll",
+        "test": "fn1.7/fn1.7.test.syntaxnet.conll",
+    }
+}
 KNOWN_DATASETS = {
     "cnn": {"dataset": "cnn_dailymail", "config": "3.0.0"},
     "wikiann": {"dataset": "wikiann", "config": "en"},
@@ -41,7 +51,7 @@ KNOWN_DATASETS = {
     "wnut": {"dataset": None, "config": None},  # local parser only
     "ontonotes": {"dataset": "ontonotes5", "config": "english_v4"},
     "bc2gm": {"dataset": "spyysalo/bc2gm_corpus", "config": None},
-    "framenet": {"dataset": "liyucheng/FrameNet_v17", "config": "fulltext"},
+    "framenet": {"dataset": None, "config": "fulltext"},
 }
 
 def _normalize_wnut_split(split: str) -> str:
@@ -104,14 +114,99 @@ def _parse_wnut_file(path: Path):
     return sentences
 
 
-def _load_wnut_dataset(split: str, cache_dir: Path):
+def _load_wnut_dataset(split: str, cache_dir: Path, _config=None):
     path = _download_wnut_file(split, cache_dir)
     examples = _parse_wnut_file(path)
     return Dataset.from_list(examples)
 
 
+def _normalize_framenet_split(split: str) -> str:
+    s = split.lower()
+    if s in ("dev", "validation"):
+        return "validation"
+    return s
+
+
+def _parse_framenet_conll_file(path: Path):
+    examples = {
+        "tokens": [],
+        "lemmas": [],
+        "pos_tags": [],
+        "lexical_units": [],
+        "frame_elements": [],
+        "frame_name": [],
+    }
+    tokens = []
+    lemmas = []
+    pos_tags = []
+    lexical_units = []
+    frame_elements = []
+    frame_names_per_token = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                if tokens:
+                    examples["tokens"].append(tokens)
+                    examples["lemmas"].append(lemmas)
+                    examples["pos_tags"].append(pos_tags)
+                    examples["lexical_units"].append(lexical_units)
+                    examples["frame_elements"].append(frame_elements)
+                    frame_name = next((name for name in frame_names_per_token if name and name != "_"), "")
+                    examples["frame_name"].append(frame_name)
+                    tokens = []
+                    lemmas = []
+                    pos_tags = []
+                    lexical_units = []
+                    frame_elements = []
+                    frame_names_per_token = []
+                continue
+            parts = stripped.split("\t")
+            if len(parts) < 15:
+                continue
+            token = parts[1]
+            lemma = parts[3]
+            pos_tag = parts[5]
+            lexical_unit = parts[12]
+            frame_name = parts[13]
+            frame_element = parts[14]
+            tokens.append(token)
+            lemmas.append(lemma)
+            pos_tags.append(pos_tag)
+            lexical_units.append(lexical_unit if lexical_unit != "_" else "")
+            frame_elements.append(frame_element if frame_element and frame_element != "_" else "O")
+            frame_names_per_token.append(frame_name if frame_name != "_" else "")
+    if tokens:
+        examples["tokens"].append(tokens)
+        examples["lemmas"].append(lemmas)
+        examples["pos_tags"].append(pos_tags)
+        examples["lexical_units"].append(lexical_units)
+        examples["frame_elements"].append(frame_elements)
+        frame_name = next((name for name in frame_names_per_token if name and name != "_"), "")
+        examples["frame_name"].append(frame_name)
+    return Dataset.from_dict(examples)
+
+
+def _load_framenet_dataset(split: str, cache_dir: Path, config_name: str):
+    normalized = _normalize_framenet_split(split)
+    config_files = FRAMENET_CONFIG_FILES.get(config_name)
+    if config_files is None:
+        available = ", ".join(sorted(FRAMENET_CONFIG_FILES))
+        raise ValueError(f"Unknown FrameNet config '{config_name}'. Available configs: {available}")
+    filename = config_files.get(normalized)
+    if filename is None:
+        available = ", ".join(sorted(config_files))
+        raise ValueError(
+            f"Split '{split}' unsupported for FrameNet config '{config_name}'. Available splits: {available}"
+        )
+    downloaded = hf_hub_download(repo_id=FRAMENET_REPO_ID, filename=filename, repo_type="dataset")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return _parse_framenet_conll_file(Path(downloaded))
+
+
 SPECIAL_LOADERS = {
     "wnut": _load_wnut_dataset,
+    "framenet": _load_framenet_dataset,
 }
 
 def parse_args():
@@ -172,7 +267,7 @@ def _download_one(dataset_id, config, splits, output_root, label):
         metadata_written = False
         for split in splits:
             print(f"[build] {label} split='{split}' via local parser")
-            ds = loader(split, destination)
+            ds = loader(split, destination, config)
             if not metadata_written:
                 save_metadata(ds, destination)
                 metadata_written = True
