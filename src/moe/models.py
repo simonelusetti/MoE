@@ -185,39 +185,6 @@ class ExpertModel(nn.Module):
             mixture = torch.einsum("btk,bkf->btf", routing_weights, transformed_factors)
             token_reconstruction = self.token_decoder(mixture)
 
-        entropy = -(routing_weights.clamp_min(self.small_value).log() * routing_weights)
-        entropy = (entropy.sum(dim=-1) * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
-
-        pi_sq = (routing_weights ** 2).sum(dim=-1)
-        overlap = 0.5 * (1.0 - pi_sq)
-        overlap = (overlap * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
-
-        continuity = None
-        if self.use_continuity:
-            if routing_weights.size(1) > 1:
-                pair_mask = mask_float[:, 1:] * mask_float[:, :-1]
-                diff = routing_weights[:, 1:, :] - routing_weights[:, :-1, :]
-                diff_sq = diff.pow(2).sum(dim=-1)
-                numerator = (diff_sq * pair_mask).sum(dim=1)
-                denominator = pair_mask.sum(dim=1).clamp_min(self.small_value)
-                continuity = numerator / denominator
-            else:
-                continuity = routing_weights.new_zeros(routing_weights.size(0))
-
-        if self.use_balance:
-            expert_mass = routing_weights.sum(dim=1)
-            total_tokens = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
-            balanced_mass = expert_mass / total_tokens
-            target = routing_weights.new_full((1, self.num_experts), 1.0 / self.num_experts)
-            balance = ((balanced_mass.mean(dim=0, keepdim=True) - target) ** 2).sum()
-        else:
-            balance = routing_weights.new_zeros(())
-
-        if self.use_diversity:
-            diversity = self._compute_diversity_penalty(transformed_factors)
-        else:
-            diversity = routing_weights.new_zeros(())
-
         outputs = {
             "pi": routing_weights,
             "factors_raw": factors_raw,
@@ -225,12 +192,5 @@ class ExpertModel(nn.Module):
             "anchor": pooled,
             "reconstruction": reconstruction,
             "token_reconstruction": token_reconstruction,
-            "entropy": entropy,
-            "overlap": overlap,
-            "balance": balance,
-            "diversity": diversity,
-            "attention_entropy": None,
         }
-        if self.use_continuity:
-            outputs["continuity"] = continuity
         return outputs

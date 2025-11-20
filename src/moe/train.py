@@ -61,10 +61,44 @@ class ExpertTrainer:
         else:
             token_loss = embeddings.new_tensor(0.0)
 
-        entropy_loss = outputs["entropy"].mean()
-        overlap_loss = outputs["overlap"].mean()
-        diversity_loss = outputs["diversity"]
-        balance_loss = outputs["balance"]
+        routing_weights = outputs["pi"]
+        mask_float = attention_mask.to(dtype=routing_weights.dtype)
+
+        entropy = -(routing_weights.clamp_min(model.small_value).log() * routing_weights)
+        entropy = (entropy.sum(dim=-1) * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
+        entropy_loss = entropy.mean()
+
+        pi_sq = (routing_weights ** 2).sum(dim=-1)
+        overlap = 0.5 * (1.0 - pi_sq)
+        overlap = (overlap * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
+        overlap_loss = overlap.mean()
+
+        if model.use_balance:
+            expert_mass = routing_weights.sum(dim=1)
+            total_tokens = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
+            balanced_mass = expert_mass / total_tokens
+            target = routing_weights.new_full((1, model.num_experts), 1.0 / model.num_experts)
+            balance_loss = ((balanced_mass.mean(dim=0, keepdim=True) - target) ** 2).sum()
+        else:
+            balance_loss = routing_weights.new_zeros(())
+
+        if model.use_diversity:
+            diversity_loss = model._compute_diversity_penalty(outputs["factors"])
+        else:
+            diversity_loss = routing_weights.new_zeros(())
+
+        continuity_loss = None
+        if model.use_continuity:
+            if routing_weights.size(1) > 1:
+                pair_mask = mask_float[:, 1:] * mask_float[:, :-1]
+                diff = routing_weights[:, 1:, :] - routing_weights[:, :-1, :]
+                diff_sq = diff.pow(2).sum(dim=-1)
+                numerator = (diff_sq * pair_mask).sum(dim=1)
+                denominator = pair_mask.sum(dim=1).clamp_min(model.small_value)
+                continuity_loss = numerator / denominator
+            else:
+                continuity_loss = routing_weights.new_zeros(routing_weights.size(0))
+
         loss_components = {
             "sent": sent_loss,
             "token": token_loss,
@@ -75,9 +109,9 @@ class ExpertTrainer:
         }
 
         if "continuity" in self.weights:
-            if "continuity" not in outputs:
+            if continuity_loss is None:
                 raise KeyError("Continuity weight configured but model continuity output missing.")
-            loss_components["continuity"] = outputs["continuity"].mean()
+            loss_components["continuity"] = continuity_loss.mean()
 
         total_loss = sum(self.weights[key] * loss_components[key] for key in loss_components)
         metrics = {key: float(value.detach()) for key, value in loss_components.items()}
