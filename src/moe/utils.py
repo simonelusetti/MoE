@@ -5,15 +5,14 @@ import torch
 from prettytable import PrettyTable
 from tqdm import tqdm
 
-from ratcon.utils import (
+from ratcon.metrics import (
     build_label_groups,
     build_label_masks,
     compute_counts,
     finalize_metrics_from_counts,
-    get_logger,
     merge_count_dict,
-    should_disable_tqdm,
 )
+from ratcon.utils import get_logger, should_disable_tqdm
 
 
 def configure_runtime(cfg):

@@ -18,6 +18,7 @@ from .utils import (
     get_logger,
     should_disable_tqdm,
 )
+from ratcon.utils import prepare_batch
 
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -44,8 +45,7 @@ class ExpertTrainer:
         return weights
 
     def _loss(self, model, batch, device):
-        embeddings = batch["embeddings"].to(device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        embeddings, attention_mask, _ = prepare_batch(batch, device)
         outputs = model(embeddings, attention_mask)
         anchor = outputs["anchor"]
         reconstruction = outputs["reconstruction"]
