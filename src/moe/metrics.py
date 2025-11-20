@@ -170,24 +170,53 @@ def evaluate_factor_metrics(model, loader, device, logger=None, threshold: float
     if not has_labels:
         return {}
 
+    names = [f"factor_{idx}" for idx in range(len(stats))]
+    return summarize_factor_counts(stats, per_class_stats, label_groups, names=names)
+
+
+def summarize_factor_counts(stats, per_class_stats=None, label_groups=None, names=None):
     results = {}
-    for idx, counts in enumerate(stats):
-        tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+
+    def _iter_items():
+        if isinstance(stats, dict):
+            for name, counts in stats.items():
+                per_cls = None
+                if isinstance(per_class_stats, dict):
+                    per_cls = per_class_stats.get(name)
+                yield name, counts, per_cls
+        else:
+            stats_list = list(stats)
+            resolved_names = names or [f"factor_{idx}" for idx in range(len(stats_list))]
+            for idx, counts in enumerate(stats_list):
+                name = resolved_names[idx] if idx < len(resolved_names) else f"factor_{idx}"
+                if isinstance(per_class_stats, dict):
+                    per_cls = per_class_stats.get(name)
+                elif isinstance(per_class_stats, (list, tuple)):
+                    per_cls = per_class_stats[idx]
+                else:
+                    per_cls = None
+                yield name, counts, per_cls
+
+    label_keys = list(label_groups.keys()) if label_groups else None
+    for name, counts, per_cls in _iter_items():
+        tp = counts.get("tp", 0)
+        fp = counts.get("fp", 0)
+        fn = counts.get("fn", 0)
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-        result = {
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-        }
-        if per_class_stats:
+        result = {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
+
+        if per_cls:
             per_class_metrics = {}
-            for label, cls_counts in per_class_stats[idx].items():
-                tp_c, fp_c, fn_c = cls_counts["tp"], cls_counts["fp"], cls_counts["fn"]
+            labels = label_keys or per_cls.keys()
+            for label in labels:
+                cls_counts = per_cls.get(label)
+                if not cls_counts:
+                    continue
+                tp_c = cls_counts.get("tp", 0)
+                fp_c = cls_counts.get("fp", 0)
+                fn_c = cls_counts.get("fn", 0)
                 if (tp_c + fp_c + fn_c) == 0:
                     continue
                 precision_c = tp_c / (tp_c + fp_c) if (tp_c + fp_c) > 0 else 0.0
@@ -207,6 +236,5 @@ def evaluate_factor_metrics(model, loader, device, logger=None, threshold: float
                 }
             if per_class_metrics:
                 result["per_class"] = per_class_metrics
-        results[f"factor_{idx}"] = result
-
+        results[name] = result
     return results
