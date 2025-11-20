@@ -10,8 +10,14 @@ from dora import get_xp, hydra_main
 
 from .data import initialize_dataloaders
 from .models import ExpertModel
-from .utils import configure_runtime, get_logger, should_disable_tqdm
-from .metrics import build_train_table, build_eval_table, evaluate_factor_metrics
+from .utils import (
+    build_eval_table,
+    build_train_table,
+    configure_runtime,
+    evaluate_factor_metrics,
+    get_logger,
+    should_disable_tqdm,
+)
 
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")

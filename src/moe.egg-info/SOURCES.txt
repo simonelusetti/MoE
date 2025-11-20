@@ -3,7 +3,6 @@ pyproject.toml
 setup.cfg
 src/moe/__init__.py
 src/moe/data.py
-src/moe/metrics.py
 src/moe/models.py
 src/moe/train.py
 src/moe/utils.py
